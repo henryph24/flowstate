@@ -1,0 +1,21 @@
+.build/
+build/
+.DS_Store
+*.log
+
+# Personal Claude Code settings (machine-specific hooks)
+.claude/settings.local.json
+
+# Internal working docs (AI-assistant context, dev journal) — local only
+CLAUDE.md
+AGENTS.md
+tasks/
+.codex/
+.entire/
+entire/
+
+# Secrets and large model files
+.env
+.env.*
+*.gguf
+*.bin

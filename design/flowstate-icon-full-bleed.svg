@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!-- Full-bleed square artwork for scripts/make_icns.py, which applies
+       Apple's icon geometry (824px rounded square on a 1024 canvas) itself.
+       Same art as flowstate-logo.svg, scaled 2x, no tile margin/corners. -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1b1740"/>
+      <stop offset="0.55" stop-color="#2b2170"/>
+      <stop offset="1" stop-color="#0e3a5c"/>
+    </linearGradient>
+    <linearGradient id="stroke" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#9aa8ff"/>
+      <stop offset="0.55" stop-color="#cfd8ff"/>
+      <stop offset="1" stop-color="#7ee6d4"/>
+    </linearGradient>
+    <radialGradient id="halo" cx="0.5" cy="0.38" r="0.65">
+      <stop offset="0" stop-color="#8f9dff" stop-opacity="0.20"/>
+      <stop offset="1" stop-color="#8f9dff" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <rect width="1024" height="1024" fill="url(#bg)"/>
+  <rect width="1024" height="1024" fill="url(#halo)"/>
+
+  <path d="M 176 744
+           C 198 688, 216 688, 238 744  C 260 800, 278 800, 300 744
+           C 326 676, 354 676, 380 744 C 406 812, 434 812, 460 744
+           C 522 616, 610 616, 672 744"
+        fill="none" stroke="url(#stroke)"
+        stroke-width="44" stroke-linecap="round"/>
+  <circle cx="744" cy="796" r="32" fill="#7ee6d4"/>
+
+  <text x="512" y="524" text-anchor="middle"
+        font-family="Georgia, 'Times New Roman', serif" font-size="432"
+        fill="#eef1ff">
+    <tspan font-style="italic">f</tspan><tspan dx="12" font-style="normal">(</tspan><tspan dx="4" font-style="italic">s</tspan><tspan dx="8" font-style="normal">)</tspan>
+  </text>
+</svg>
