@@ -1,0 +1,47 @@
+{
+  "cli_version": "0.10.3",
+  "checkpoint_id": "01M37W9AA143WJ1SFAR4N8T53T",
+  "session_id": "d9f69700-55f7-49d1-9658-95e55f0075c7",
+  "strategy": "manual-commit",
+  "created_at": "2026-09-23T19:36:08.069434Z",
+  "branch": "goodnight/20260924-verbatim-prompt",
+  "checkpoints_count": 1,
+  "save_step_count": 1,
+  "files_touched": [],
+  "agent": "Claude Code",
+  "model": "claude-opus-5-5",
+  "turn_id": "29fb73059839",
+  "compact_transcript_start": 0,
+  "token_usage": {
+    "input_tokens": 176,
+    "cache_creation_tokens": 696836,
+    "cache_read_tokens": 20499947,
+    "output_tokens": 232185,
+    "api_call_count": 88
+  },
+  "skill_events_version": 1,
+  "skill_events": [
+    {
+      "id": "prompt-skill-claude-code-good-night-2026-09-23T16:14:53.306975Z",
+      "event_type": "prompt_invocation",
+      "skill": {
+        "name": "good-night"
+      },
+      "source": {
+        "agent": "claude-code",
+        "signal": "prompt_slash_command",
+        "confidence": "explicit"
+      },
+      "turn_id": "bb066b80a715",
+      "timestamp": "2026-09-23T16:14:53.306975Z",
+      "native": {
+        "command": "/good-night"
+      },
+      "collapse": {
+        "target": "user_message",
+        "label": "/good-night",
+        "default_collapsed": true
+      }
+    }
+  ]
+}
