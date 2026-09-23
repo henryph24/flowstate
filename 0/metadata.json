@@ -1,0 +1,110 @@
+{
+  "cli_version": "0.10.3",
+  "checkpoint_id": "01M37W4347MPVFNNNY3FH971B3",
+  "session_id": "d9f69700-55f7-49d1-9658-95e55f0075c7",
+  "strategy": "manual-commit",
+  "created_at": "2026-09-23T19:33:18.146165Z",
+  "branch": "goodnight/20260924-cleanup-guard",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "README.md",
+    "Sources/MurmurKit/Cleaner.swift",
+    "Sources/MurmurKit/CleanupGuard.swift",
+    "Sources/MurmurTests/main.swift"
+  ],
+  "agent": "Claude Code",
+  "model": "claude-opus-5-5",
+  "turn_id": "29fb73059839",
+  "compact_transcript_start": 0,
+  "token_usage": {
+    "input_tokens": 160,
+    "cache_creation_tokens": 683598,
+    "cache_read_tokens": 17250612,
+    "output_tokens": 223723,
+    "api_call_count": 80
+  },
+  "skill_events_version": 1,
+  "skill_events": [
+    {
+      "id": "prompt-skill-claude-code-good-night-2026-09-23T16:14:53.306975Z",
+      "event_type": "prompt_invocation",
+      "skill": {
+        "name": "good-night"
+      },
+      "source": {
+        "agent": "claude-code",
+        "signal": "prompt_slash_command",
+        "confidence": "explicit"
+      },
+      "turn_id": "bb066b80a715",
+      "timestamp": "2026-09-23T16:14:53.306975Z",
+      "native": {
+        "command": "/good-night"
+      },
+      "collapse": {
+        "target": "user_message",
+        "label": "/good-night",
+        "default_collapsed": true
+      }
+    }
+  ],
+  "initial_attribution": {
+    "calculated_at": "2026-09-23T19:33:17.998293Z",
+    "agent_lines": 196,
+    "agent_removed": 0,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 8,
+    "total_committed": 196,
+    "total_lines_changed": 204,
+    "agent_percentage": 96.07843137254902,
+    "metric_version": 2
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 1,
+      "user_lines_added": 12338,
+      "user_lines_removed": 8,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0,
+      "user_added_per_file": {
+        ".goodnight/baseline.txt": 64,
+        ".goodnight/bench/Package.swift": 13,
+        ".goodnight/bench/Sources/Bench/main.swift": 144,
+        ".goodnight/bench/cleanup_corpus.json": 50,
+        ".goodnight/bench/heldout_corpus.json": 410,
+        ".goodnight/bench/real_fixtures/refs.json": 294,
+        ".goodnight/bench/results/base-llama32-3b.json": 580,
+        ".goodnight/bench/results/corrector-only.json": 574,
+        ".goodnight/bench/results/guard-lfm25-1.2b.json": 574,
+        ".goodnight/bench/results/guard-llama32-3b.json": 574,
+        ".goodnight/bench/results/guard2-cleanup_corpus-llama32.json": 574,
+        ".goodnight/bench/results/guard2-cleanup_corpus-qwen3-4b.json": 574,
+        ".goodnight/bench/results/guard2-heldout_corpus-llama32.json": 652,
+        ".goodnight/bench/results/guard2-heldout_corpus-qwen3-4b.json": 652,
+        ".goodnight/bench/results/heldout-corrector-only.json": 652,
+        ".goodnight/bench/results/heldout-guard-llama32-3b.json": 652,
+        ".goodnight/bench/results/stt-real-small.en-bs5.json": 586,
+        ".goodnight/bench/results/stt-real-turbo-bs5.json": 586,
+        ".goodnight/bench/results/stt-real-turbo-greedy.json": 586,
+        ".goodnight/bench/results/stt-small.en-bs5.json": 642,
+        ".goodnight/bench/results/stt-turbo-bs2.json": 642,
+        ".goodnight/bench/results/stt-turbo-bs5.json": 642,
+        ".goodnight/bench/results/stt-turbo-greedy.json": 642,
+        ".goodnight/bench/stt_bench.py": 165,
+        ".goodnight/caffeinate.pid": 1,
+        ".goodnight/notes.md": 63,
+        ".goodnight/state.json": 166,
+        "README.md": 5,
+        "Sources/MurmurKit/Cleaner.swift": 7,
+        "Sources/MurmurKit/CleanupGuard.swift": 437,
+        "Sources/MurmurTests/main.swift": 135
+      },
+      "user_removed_per_file": {
+        "README.md": 2,
+        "Sources/MurmurKit/Cleaner.swift": 2,
+        "Sources/MurmurTests/main.swift": 4
+      }
+    }
+  ]
+}
