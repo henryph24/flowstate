@@ -1183,7 +1183,9 @@ await {
     builtinChat.onCall = { system, _, _ in builtinSystem = system }
     _ = await Cleaner(chat: builtinChat, vocabulary: Config().cleanupVocabulary)
         .cleanOrFallback("install pie torch with uv please")
-    expect(builtinSystem.contains("Remove filler words"), "base cleanup rules survive the vocabulary rule")
+    expect(builtinSystem.contains("Delete filler sounds"), "base cleanup rules survive the vocabulary rule")
+    expect(builtinSystem.contains("Keep every other word exactly as spoken"),
+           "cleanup prompt demands verbatim copying")
     expect(builtinSystem.contains("PyTorch") && builtinSystem.contains("Kubernetes"),
            "cleanup system prompt carries the built-in vocabulary by default")
 
@@ -1195,7 +1197,7 @@ await {
         .cleanOrFallback("some dictated words to clean here")
     expect(swappedSystem.contains("BetaTermTwo") && !swappedSystem.contains("AlphaTermOne"),
            "withVocabulary swaps the spelling rule")
-    expect(swappedSystem.contains("Remove filler words"), "withVocabulary keeps the base rules")
+    expect(swappedSystem.contains("Delete filler sounds"), "withVocabulary keeps the base rules")
 
     // The guard sits between the model and the paste: a paraphrase or a
     // dropped clause never reaches the user's document.
