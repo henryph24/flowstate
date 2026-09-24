@@ -1,7 +1,9 @@
 import Foundation
 
 /// LLM pass over the raw transcript: filler removal, self-corrections,
-/// punctuation. Never throws — any failure falls back to the raw transcript.
+/// punctuation. Never throws — any failure falls back to the raw transcript,
+/// and `CleanupGuard` reverts any edit beyond those (a paraphrase, a dropped
+/// clause, an answer), so the speaker's own words always come through.
 public struct Cleaner {
     public static let basePrompt = """
     You clean up dictated speech transcripts. The user message contains ONLY a \
@@ -23,6 +25,7 @@ public struct Cleaner {
     private let chat: ChatEngine
     private let minWords: Int
     private let systemPrompt: String
+    private let vocabularyKeys: Set<String>
 
     /// Re-anchors the behavioral contract AFTER the (long) vocabulary
     /// glossary — small models weight the end of the system prompt, and
@@ -33,6 +36,7 @@ public struct Cleaner {
     public init(chat: ChatEngine, minWords: Int = 4, vocabulary: [String] = []) {
         self.chat = chat
         self.minWords = minWords
+        self.vocabularyKeys = CleanupGuard.vocabularyKeys(vocabulary)
         if let rule = VocabularyPrompt.cleanupRule(vocabulary) {
             self.systemPrompt = Self.basePrompt + "\n" + rule + "\n" + Self.closingReminder
         } else {
@@ -60,7 +64,8 @@ public struct Cleaner {
             let cleaned = sanitize(try await chat.chatComplete(
                 system: systemPrompt, user: payload, maxTokens: maxTokens))
             guard !cleaned.isEmpty, cleaned.count <= trimmed.count * 3 else { return trimmed }
-            return cleaned
+            return CleanupGuard.reconcile(transcript: trimmed, cleaned: cleaned,
+                                          vocabularyKeys: vocabularyKeys)
         } catch {
             return trimmed
         }

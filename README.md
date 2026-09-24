@@ -9,7 +9,7 @@ Hold a key, speak, release: clean, correctly-spelled text appears at your cursor
 
 > *you say:* "um so basically we should uh fine tune the model with pie torch, no wait, with MLX"
 >
-> *Flowstate types:* `We should fine-tune the model with MLX.`
+> *Flowstate types:* `So basically we should fine-tune the model with MLX.`
 
 ## Vision
 
@@ -51,7 +51,10 @@ refuses both trade-offs:
   3. *Local LLM cleanup*: removes fillers, applies self-corrections
      ("meet at 2, no wait, 3" → "meet at 3"), repairs remaining misheard
      terms. ~0.3 s warm; a cold model falls back to the raw transcript
-     rather than ever blocking your paste.
+     rather than ever blocking your paste. A word-level guard then keeps
+     only those edits: a paraphrase, a dropped clause, or an answer to a
+     dictated question is reverted to your own words, so your sentences
+     come through as you said them.
 
 - **It learns from you.** Fix a term in text Flowstate just pasted, and it
   notices (one Accessibility read-back of that same field). A correction that
