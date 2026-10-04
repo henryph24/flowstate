@@ -264,10 +264,6 @@ do {
     expectEqual(warmBody["max_tokens"] as? Int, 1, "prewarm asks for one token")
     expectEqual(warmBody["cache_prompt"] as? Bool, true, "prewarm caches the system prefix")
 
-    let healthReq = LlamaCppChatEngine.healthRequest(port: 8725)
-    expectEqual(healthReq.url?.absoluteString, "http://127.0.0.1:8725/health", "health URL")
-    expectEqual(healthReq.timeoutInterval, 1, "health probe is quick")
-
     let good = #"{"choices":[{"message":{"content":"  Cleaned text. "}}]}"#
     expectEqual(try? LlamaCppChatEngine.parseChatResponse(Data(good.utf8)), "Cleaned text.",
                 "chat response parsed and trimmed")
@@ -1912,6 +1908,48 @@ await {
                 "a cleanup prewarm with no verified server reports false")
     expectEqual(hits.value, 0, "no prewarm request reaches a squatter on the preferred port")
 
+    // A squatter that binds the cleanup child's port after the spawn (lsof
+    // cannot see another user's listener when the port is picked) gets
+    // neither the dictated text nor the warm-up prompt: the cleanup engine
+    // accepts only a server its own child holds.
+    let announced = FileManager.default.temporaryDirectory
+        .appendingPathComponent("llama_port_\(UUID().uuidString)")
+    let announcer = FileManager.default.temporaryDirectory
+        .appendingPathComponent("llama_announce_\(UUID().uuidString)")
+    FileManager.default.createFile(
+        atPath: announcer.path,
+        contents: Data("#!/bin/sh\nwhile [ $# -gt 0 ]; do [ \"$1\" = --port ] && echo \"$2\" > '\(announced.path)'; shift; done\nexec sleep 5\n".utf8),
+        attributes: [.posixPermissions: 0o755])
+    defer {
+        try? FileManager.default.removeItem(at: announcer)
+        try? FileManager.default.removeItem(at: announced)
+    }
+    let hidden = LlamaCppChatEngine(binaryPath: announcer.path, modelPath: model.path,
+                                    port: LocalServer.freeLoopbackPort() ?? 18_785)
+    defer { hidden.shutdown() }
+    let dictation = Task.detached {
+        try await hidden.chatComplete(system: "System: Secret.", user: "dictated words", maxTokens: 8)
+    }
+    var hiddenSquatter: FakeHealthResponder?
+    for _ in 0..<300 where hiddenSquatter == nil {
+        if let text = try? String(contentsOf: announced, encoding: .utf8),
+           let port = Int(text.trimmingCharacters(in: .whitespacesAndNewlines)) {
+            hiddenSquatter = FakeHealthResponder(port: port)
+        } else {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+    }
+    defer { hiddenSquatter?.stop() }
+    expect(hiddenSquatter != nil, "a squatter took the cleanup child's port after the spawn")
+    var refused = false
+    if case .failure(let error) = await dictation.result, case LlamaCppError.serverLoading = error {
+        refused = true
+    }
+    expect(refused, "cleanup reports the server not ready when another process answers on its port")
+    expectEqual(await hidden.prewarm(prompt: "System: Secret.").value, false,
+                "the cleanup warm-up refuses that server as well")
+    expectEqual(hiddenSquatter?.postCount, 0, "neither the dictated text nor the prompt reaches the squatter")
+
     // Read-ahead: llama-server maps its model file, so weights evicted while
     // the server idles come back one GPU page fault at a time; one sequential
     // read of the missing parts brings them back at disk speed.
@@ -2126,6 +2164,11 @@ do {
 final class FakeHealthResponder {
     private let source: DispatchSourceRead
 
+    private let postLock = NSLock()
+    private var posts = 0
+    /// POST requests received so far (a chat request; /health is a GET).
+    var postCount: Int { postLock.lock(); defer { postLock.unlock() }; return posts }
+
     /// `delay` holds each reply back, so it can land after a child exited.
     /// `onRequest` runs before each reply with the request's 1-based number.
     init?(port: Int, delay: TimeInterval = 0, onRequest: ((Int) -> Void)? = nil) {
@@ -2150,12 +2193,13 @@ final class FakeHealthResponder {
                                                queue: DispatchQueue(label: "fake-health"))
         final class Count { var value = 0 }
         let requests = Count()
-        source.setEventHandler {
+        source.setEventHandler { [weak self] in
             let client = accept(fd, nil, nil)
             guard client >= 0 else { return }
             var request = [UInt8](repeating: 0, count: 4096)
-            _ = read(client, &request, request.count)
+            let received = read(client, &request, request.count)
             requests.value += 1
+            if received >= 4, request.starts(with: Array("POST".utf8)) { self?.countPost() }
             onRequest?(requests.value)
             if delay > 0 { Thread.sleep(forTimeInterval: delay) }
             let reply = Array("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".utf8)
@@ -2167,6 +2211,12 @@ final class FakeHealthResponder {
     }
 
     func stop() { source.cancel() }
+
+    private func countPost() {
+        postLock.lock()
+        posts += 1
+        postLock.unlock()
+    }
 }
 
 /// Fraction of `path`'s pages in the page cache (mincore over a fresh mapping).

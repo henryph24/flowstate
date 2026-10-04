@@ -65,7 +65,7 @@ refuses both trade-offs:
 
 - **Boring, auditable engineering.** Pure Swift/SwiftPM, zero external Swift
   dependencies, builds with Command Line Tools only (no Xcode). One binary,
-  local child servers for speech and cleanup, 1111 tests including live
+  local child servers for speech and cleanup, 1119 tests including live
   integration against the real STT and LLM servers.
 
 ## Setup
@@ -171,7 +171,7 @@ macOS takes an idle server's memory back, and the next dictation waits while
 the model comes back into memory. Pressing the hotkey starts that reload for
 Qwen3-ASR, Parakeet and the cleanup model while you speak: after 10 GB of
 other file reads, a 5 s dictation on Qwen3-ASR 1.7B with cleanup took 0.9 to
-1.1 s when the hotkey was held 3 s, and 5.4 to 7.8 s with no head start.
+1.1 s when the hotkey was held 3 s, and 5.8 to 6.2 s with no head start.
 Whisper is left out: its server encodes a full 30 s window for any request, so
 a warm-up delayed short dictations by 0.4 s.
 
@@ -259,7 +259,7 @@ Restart Flowstate after editing.
 ```sh
 swift build                  # SwiftPM only, no Xcode required
 swift run Murmur             # dev run, inherits the terminal's permissions
-swift run MurmurTests        # 1111 unit + local-integration assertions
+swift run MurmurTests        # 1119 unit + local-integration assertions
 ```
 
 Dev-loop env overrides: `MURMUR_HOTKEY`, `MURMUR_ENGINE`,

@@ -26,40 +26,43 @@ public enum LlamaCppError: Error, LocalizedError {
     }
 }
 
-/// Local cleanup LLM: spawns and owns a warm `llama-server` child (llama.cpp,
-/// loopback) and speaks its OpenAI-compatible `/v1/chat/completions`. Mirrors
-/// `WhisperCppEngine`'s child-server lifecycle, with one refinement: readiness
-/// uses llama-server's `/health` (503 while the model loads, 200 when ready),
-/// so an orphaned-but-loading server is polled instead of re-spawned. Cleanup
-/// is optional, so `chatComplete` waits at most ~2s for warmth and otherwise
-/// throws (`Cleaner` falls back to the raw transcript) — only `warmUp()` /
-/// `ensureReady()` sit through a cold model load.
+/// Local cleanup LLM: a warm `llama-server` child (llama.cpp, loopback) run by
+/// `ChildServer`, speaking its OpenAI-compatible `/v1/chat/completions`.
+/// `ChildServer` reuses a verified orphan, accepts a spawned child only once
+/// the child holds its port, and runs one start at a time. Cleanup is
+/// optional, so a dictation waits at most 2 s for the server (plus a start
+/// already under way, which polls once) and otherwise throws: `Cleaner`
+/// falls back to the raw transcript. Only `ensureReady()` sits through a cold
+/// model load.
 public final class LlamaCppChatEngine: ChatEngine, LocalServerEngine, Prewarmable {
     static let warmUpPolls = 240 // × 250ms = 60s — cold GGUF load
     static let requestPolls = 8  // × 250ms = 2s — never make a paste wait
+    /// One probe: spawn the child if none runs; its model loads on its own.
+    static let spawnPolls = 1
 
     private let binaryPath: String
     private let modelPath: String
-    private let preferredPort: Int
-    private var activePort: Int
     private let session: URLSession
-    private var process: Process?
+    private let server: ChildServer
 
     public init(binaryPath: String, modelPath: String, port: Int,
                 session: URLSession = LoopbackURLSession.make(resourceTimeout: 30)) {
+        let model = (modelPath as NSString).expandingTildeInPath
         self.binaryPath = binaryPath
-        self.modelPath = (modelPath as NSString).expandingTildeInPath
-        self.preferredPort = port
-        self.activePort = port
+        self.modelPath = model
         self.session = session
+        self.server = ChildServer(name: "llama-server", binaryPath: binaryPath,
+                                  port: port, session: session) { port in
+            Self.serverArguments(modelPath: model, port: port)
+        }
     }
 
     deinit { shutdown() }
 
     public func chatComplete(system: String, user: String, maxTokens: Int) async throws -> String {
-        try await ensureServerRunning(pollBudget: Self.requestPolls)
+        try await ensureServerRunning(polls: Self.requestPolls)
         let request = try Self.makeChatRequest(system: system, user: user,
-                                               maxTokens: maxTokens, port: activePort)
+                                               maxTokens: maxTokens, port: server.port)
         let (data, response) = try await session.data(for: request)
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         guard status == 200 else { throw LlamaCppError.http(status: status) }
@@ -70,14 +73,14 @@ public final class LlamaCppChatEngine: ChatEngine, LocalServerEngine, Prewarmabl
     /// utterance. Safe to call repeatedly.
     public func warmUp() {
         Task.detached { [weak self] in
-            try? await self?.ensureServerRunning(pollBudget: Self.warmUpPolls)
+            try? await self?.ensureServerRunning(polls: Self.spawnPolls)
         }
     }
 
     /// Blocks through a full cold load — for tests/pre-flight, not the
     /// utterance path.
     public func ensureReady() async throws {
-        try await ensureServerRunning(pollBudget: Self.warmUpPolls)
+        try await ensureServerRunning(polls: Self.warmUpPolls)
     }
 
     /// `prompt` is the cleanup system prompt (see `Cleaner.prewarm`). Reads
@@ -89,8 +92,8 @@ public final class LlamaCppChatEngine: ChatEngine, LocalServerEngine, Prewarmabl
             guard let self else { return false }
             async let weights: Void = Prewarm.readAheadInBackground(self.modelPath)
             var answered = false
-            if (try? await self.ensureServerRunning(pollBudget: Self.requestPolls)) != nil {
-                answered = await Prewarm.send(try? Self.makePrewarmRequest(system: prompt ?? "", port: self.activePort),
+            if (try? await self.ensureServerRunning(polls: Self.spawnPolls)) != nil {
+                answered = await Prewarm.send(try? Self.makePrewarmRequest(system: prompt ?? "", port: self.server.port),
                                               with: self.session)
             }
             await weights
@@ -99,58 +102,21 @@ public final class LlamaCppChatEngine: ChatEngine, LocalServerEngine, Prewarmabl
     }
 
     public func shutdown() {
-        process?.terminate()
-        process = nil
+        server.shutdown()
     }
 
-    // MARK: server lifecycle (mirrors WhisperCppEngine, /health-aware)
-
-    private enum Health { case ready, loading, down }
-
-    private func health() async -> Health {
-        guard let (_, response) = try? await session.data(for: Self.healthRequest(port: activePort)),
-              let http = response as? HTTPURLResponse else { return .down }
-        return http.statusCode == 200 ? .ready : .loading
-    }
-
-    private func ensureServerRunning(pollBudget: Int) async throws {
-        // Fast path: a child WE spawned this session is already warm.
-        if let running = process, running.isRunning, await health() == .ready { return }
-
-        // Spawn/adopt only when we don't already own a running child. Never adopt
-        // a listener we can't attribute to our binary (a squatter answering
-        // /health would otherwise sit in the paste path); reuse a verified orphan,
-        // else spawn on a private port.
-        if process == nil || process?.isRunning != true {
+    private func ensureServerRunning(polls: Int) async throws {
+        let ready = try await server.ensureRunning(polls: polls) {
             guard LocalServer.isSafeToExecute(binaryPath) else {
                 throw LlamaCppError.binaryMissing(binaryPath)
             }
             guard FileManager.default.fileExists(atPath: modelPath) else {
                 throw LlamaCppError.modelMissing(modelPath)
             }
-            switch LocalServer.resolvePort(preferred: preferredPort, binaryPath: binaryPath) {
-            case .adopt(let port):
-                activePort = port
-            case .spawn(let port):
-                activePort = port
-                let server = Process()
-                server.executableURL = URL(fileURLWithPath: binaryPath)
-                server.arguments = Self.serverArguments(modelPath: modelPath, port: activePort)
-                server.standardOutput = FileHandle.nullDevice
-                server.standardError = FileHandle.nullDevice
-                server.environment = LocalServer.sanitizedEnvironment()
-                try server.run()
-                process = server
-                Log.info("llama-server spawned (pid \(server.processIdentifier), port \(activePort))")
-            }
         }
-
-        for _ in 0..<pollBudget {
-            if await health() == .ready { return }
-            try await Task.sleep(nanoseconds: 250_000_000)
+        guard ready else {
+            throw polls < Self.warmUpPolls ? LlamaCppError.serverLoading : LlamaCppError.serverTimeout
         }
-        throw pollBudget < Self.warmUpPolls ? LlamaCppError.serverLoading
-                                            : LlamaCppError.serverTimeout
     }
 
     // MARK: pure builders
@@ -167,12 +133,6 @@ public final class LlamaCppChatEngine: ChatEngine, LocalServerEngine, Prewarmabl
          "-c", "4096",
          "-ngl", "99",
          "-t", String(max(4, ProcessInfo.processInfo.activeProcessorCount / 2))]
-    }
-
-    public static func healthRequest(port: Int) -> URLRequest {
-        var request = URLRequest(url: URL(string: "http://127.0.0.1:\(port)/health")!)
-        request.timeoutInterval = 1
-        return request
     }
 
     /// The system prompt with a placeholder transcript, one output token.

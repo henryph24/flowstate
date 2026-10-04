@@ -48,7 +48,7 @@ public protocol LocalServerEngine: AnyObject {
 /// short of memory: llama-server's mapped model file drops out of the page
 /// cache, and the rest is compressed or swapped. The next request waits while
 /// the weights come back: after 10 GB of other file reads, a 5 s dictation on
-/// Qwen3-ASR 1.7B and the 3B cleanup model took 5.4 to 7.8 s (0.6 to 1.0 s
+/// Qwen3-ASR 1.7B and the 3B cleanup model took 5.8 to 6.2 s (0.6 to 0.8 s
 /// warm, M3 Pro, 36 GB). Started at key-down, the same page-in runs while the
 /// user speaks: 0.9 to 1.1 s after a 3 s hold, 1.1 to 1.8 s after a 1 s hold.
 public protocol Prewarmable: AnyObject {

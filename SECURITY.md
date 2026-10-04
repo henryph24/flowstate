@@ -26,8 +26,8 @@ Flowstate is a local, single-user macOS dictation app:
 
 - It requires macOS **Accessibility** (global hotkey, and optional auto-learn
   field read-back) and **Microphone** permissions.
-- It spawns local inference servers (whisper.cpp / Kyutai / llama.cpp) bound
-  to **loopback only**.
+- It spawns local inference servers (whisper.cpp / parakeet.cpp / Kyutai /
+  llama.cpp) bound to **loopback only**.
 - Dictation content is sensitive: everything you speak is transcribed
   locally, and if you opt into the Groq engine, sent to Groq's cloud API.
   Treat dictated content accordingly.
