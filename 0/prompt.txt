@@ -1,0 +1,52 @@
+<task-notification>
+<task-id>a8c4ded2394f2ec05</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-hungpq2412-flowstate/8432bfbd-ac76-4330-b4e2-211cab79f7b4/tasks/a8c4ded2394f2ec05.output</output-file>
+<status>completed</status>
+<summary>Agent "Verify final prewarm fix state" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>**Verification of 9140b07 (compared with d0def72): 6 PASS, 2 FAIL** (criterion 5 for the cleanup engine, and criterion 8). Work ran from 1791090700 to about 1791091200, under the 18-minute stop. I changed no repo files and ran no `rm`.
+
+1. **PASS.** `recorder.start()` is at AppController.swift:237 and `Prewarm.forDictation` follows at :243-244. Only three types conform to `Prewarmable`: LlamaCppChatEngine:37, QwenAsrEngine:26 and ParakeetEngine:25. Each warm-up goes through the same start path as its real request: Qwen :83 vs :57, Parakeet :73 vs :52, cleanup :92 vs :60. Each request is minimal (1 s of silence, or max_tokens 1). whisper.cpp gets none (test main.swift:212-217), and neither do cloud speech or the Groq chat engine (main.swift:1864, :1876).
+
+2. **PASS.** Qwen (:81) and cleanup (:90) call `readAheadInBackground`. TranscriptionEngine.swift:92-131 checks residency with `mincore`, then `pread`s each 4 MiB window that holds a missing page, so resident pages inside such a window are read again. :135-142 runs this on `DispatchQueue.global`. Suite output: "round 1: 0.55s, 100% resident, 100% 2 s later" and "round 2: 0.40s, 100% resident, 100% 2 s later".
+
+3. **PASS.** Cleaner.swift:62 and :76-77 both send `systemPrompt` (test main.swift:1862). For speech, AppController :244 and :293 use the same expression. By design, the deferred flush at :249 can change both prompts before release (comment at :240-242).
+
+4. **PASS.** `git diff d0def72 -- Sources/MurmurKit/AppController.swift` adds only the key-down line. The release line (d0def72:286, now :293) is unchanged.
+
+5. **FAIL for cleanup; PASS for Qwen and Parakeet.** I ran a scratch harness against the built MurmurKit. A stand-in child never binds its port, and a separate Python listener takes the preferred port after the `lsof` check.
+   - Cleanup output: `llama prewarm answered 200: true`, and the listener logged `/v1/chat/completions {..."content":"System: Secret-cleanup.","role":"system"}...`.
+   - Qwen output: `another process answered on port 18792; refusing it` and `qwen prewarm answered 200: false`. Nothing reached the listener.
+   - Cause: the poll loop at LlamaCppChatEngine.swift:148-151 accepts any 200 and never checks that its own child holds the port (ChildServer.swift:148-164 does). The gap already existed at d0def72:130-133, but the warm-up now sends the vocabulary-bearing system prompt on every key-down.
+   - It can happen for real: `netstat` shows port 22 listening, while `lsof` lists only this user's 28 listeners, so `lsof` cannot see another user's process.
+   - Missing test: main.swift:1909-1913 only covers a listener that `lsof` sees before the spawn.
+
+6. **PASS.**
+   - Fresh `swift build --scratch-path …` (39 compile steps): one warning, from the toolchain ("could not determine XCTest paths"), none in source.
+   - `swift run --scratch-path … MurmurTests`, outside the sandbox, took 54 s: "1117 passed, 0 failed".
+   - Integration lines:
+     - read-ahead: as in item 2
+     - whisper.cpp: "transcript (1.63s incl. model load): The quick brown fox jumps over the lazy dog.", "warm second pass: 0.60s"
+     - Parakeet: "transcript (1.32s…)", "warm second pass: 0.05s", "prewarm: 0.03s", "silence: ''", "70 s, chunked (0.75s)"
+     - Qwen3-ASR: "transcript (2.95s…)", "warm second pass: 0.18s", "prewarm: 0.08s", "70 s, chunked (1.51s)"
+     - Kyutai: "pass 1 (2.07s)", "pass 2 warm (1.88s)", "pass 3 silence (1.46s): ''"
+     - llama.cpp cleanup: "server ready in 2.2s", "warm call: 0.28s", "prewarm: 0.06s"
+     - Groq: SKIPPED
+   - `pgrep` afterwards shows only 74842 and 74843.
+
+7. **PASS.** `codesign --verify --deep --strict` succeeds. The binary was written at 12:09:23 and the newest source at 12:08:33; pid 74811 started at 12:09:37. `nm` finds 113 prewarm symbols, and the binary imports `_mincore`, `_mmap` and `_pread` but not `_fcntl`.
+
+8. **FAIL, 2 items:**
+   - README.md:68 and :262, added in this commit, say 1111 tests. The suite and todo.md both say 1117.
+   - TranscriptionEngine.swift:101 says "165 ms to read it again". todo.md has no 165; its only figure there is "10 ms on a warm 2 GB file" (:105).
+   - Minor: README.md:172-174 pairs the 3 s-hold run (0.88-1.09 s) with the earlier reproduction run (5.35-7.84 s); the final run's plain figure was 5.78-6.19 s. "So the server caches its prefix" (:58) was never measured.
+   - Em dashes: none in the new docs or comments. The 4 added ones are test print strings at main.swift:2664, 2668, 2719 and 2723.
+
+**Other defect, from reading the code only (not reproduced):** LlamaCppChatEngine's `process` and `activePort` have no lock. The detached warm-up can write them while `shutdown()` or `chatComplete` runs on another thread.
+
+**Not done:**
+- I did not test with a real second user account. The bind race above stood in for a listener `lsof` cannot see.
+- A Sonnet subagent ran the first pass on criteria 7 and 8. I re-checked the signature, the timestamps, the 1111 count, the 165 ms claim and the run pairing myself.</result>
+<usage><subagent_tokens>150049</subagent_tokens><tool_uses>27</tool_uses><duration_ms>543729</duration_ms></usage>
+</task-notification>

@@ -1,0 +1,37 @@
+{
+  "cli_version": "0.10.3",
+  "checkpoint_id": "01M42VM6TNA5D9FKREQY6EXTBN",
+  "strategy": "manual-commit",
+  "branch": "main",
+  "checkpoints_count": 2,
+  "files_touched": [
+    "README.md",
+    "SECURITY.md",
+    "Sources/MurmurKit/LlamaCppChatEngine.swift",
+    "Sources/MurmurKit/TranscriptionEngine.swift",
+    "Sources/MurmurTests/main.swift"
+  ],
+  "sessions": [
+    {
+      "metadata": "/0/metadata.json",
+      "transcript": "/0/full.jsonl",
+      "compact_transcript": "/0/transcript.jsonl",
+      "content_hash": "/0/content_hash.txt",
+      "prompt": "/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 60,
+    "cache_creation_tokens": 460855,
+    "cache_read_tokens": 11536692,
+    "output_tokens": 63006,
+    "api_call_count": 29,
+    "subagent_tokens": {
+      "input_tokens": 44,
+      "cache_creation_tokens": 126243,
+      "cache_read_tokens": 2326022,
+      "output_tokens": 42804,
+      "api_call_count": 22
+    }
+  }
+}
