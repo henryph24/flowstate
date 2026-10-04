@@ -1,0 +1,20 @@
+{
+  "tool_use_id": "toolu_01Xq79Y8LH6tzq5Ghf61beax",
+  "agent_id": "a8c4ded2394f2ec05",
+  "subagent_type": "general-purpose",
+  "task_description": "Verify final prewarm fix state",
+  "files": [
+    "README.md",
+    "Sources/MurmurKit/AppController.swift",
+    "Sources/MurmurKit/Cleaner.swift",
+    "Sources/MurmurKit/Config.swift",
+    "Sources/MurmurKit/LlamaCppChatEngine.swift",
+    "Sources/MurmurKit/LoopbackSession.swift",
+    "Sources/MurmurKit/ParakeetEngine.swift",
+    "Sources/MurmurKit/QwenAsrEngine.swift",
+    "Sources/MurmurKit/TranscriptionEngine.swift",
+    "Sources/MurmurTests/main.swift"
+  ],
+  "started_at": "2026-10-04T12:11:31.892583+07:00",
+  "completed_at": "2026-10-04T12:11:31.896452+07:00"
+}

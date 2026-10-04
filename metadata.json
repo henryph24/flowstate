@@ -1,0 +1,46 @@
+{
+  "cli_version": "0.10.3",
+  "checkpoint_id": "01M42NK4GZ1V2GV41KPV2V1DJ9",
+  "strategy": "manual-commit",
+  "branch": "main",
+  "checkpoints_count": 6,
+  "files_touched": [
+    "README.md",
+    "Sources/MurmurKit/AppController.swift",
+    "Sources/MurmurKit/AudioChunker.swift",
+    "Sources/MurmurKit/ChildServer.swift",
+    "Sources/MurmurKit/Cleaner.swift",
+    "Sources/MurmurKit/Config.swift",
+    "Sources/MurmurKit/LlamaCppChatEngine.swift",
+    "Sources/MurmurKit/LoopbackSession.swift",
+    "Sources/MurmurKit/ParakeetEngine.swift",
+    "Sources/MurmurKit/QwenAsrEngine.swift",
+    "Sources/MurmurKit/TranscriptionEngine.swift",
+    "Sources/MurmurTests/main.swift",
+    "scripts/install_parakeet.sh",
+    "scripts/install_qwen_asr.sh"
+  ],
+  "sessions": [
+    {
+      "metadata": "/0/metadata.json",
+      "transcript": "/0/full.jsonl",
+      "compact_transcript": "/0/transcript.jsonl",
+      "content_hash": "/0/content_hash.txt",
+      "prompt": "/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 484,
+    "cache_creation_tokens": 1018927,
+    "cache_read_tokens": 64866293,
+    "output_tokens": 394948,
+    "api_call_count": 239,
+    "subagent_tokens": {
+      "input_tokens": 50,
+      "cache_creation_tokens": 214253,
+      "cache_read_tokens": 2388554,
+      "output_tokens": 46902,
+      "api_call_count": 25
+    }
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "tool_use_id": "toolu_01TbP1LEjZMbLp2tgouteUpX",
+  "agent_id": "a4d708c953cad7370",
+  "subagent_type": "general-purpose",
+  "task_description": "Verify dictation prewarm fix",
+  "files": [
+    "README.md",
+    "Sources/MurmurKit/AppController.swift",
+    "Sources/MurmurKit/Cleaner.swift",
+    "Sources/MurmurKit/Config.swift",
+    "Sources/MurmurKit/LlamaCppChatEngine.swift",
+    "Sources/MurmurKit/LoopbackSession.swift",
+    "Sources/MurmurKit/ParakeetEngine.swift",
+    "Sources/MurmurKit/QwenAsrEngine.swift",
+    "Sources/MurmurKit/TranscriptionEngine.swift",
+    "Sources/MurmurTests/main.swift"
+  ],
+  "started_at": "2026-10-04T00:49:13.28268+07:00",
+  "completed_at": "2026-10-04T00:49:13.286055+07:00"
+}
