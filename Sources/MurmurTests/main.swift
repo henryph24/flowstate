@@ -1,5 +1,6 @@
 import AppKit
 import AVFoundation
+import CryptoKit
 import MurmurKit
 
 // MARK: - harness (no XCTest in Command Line Tools)
@@ -207,6 +208,14 @@ do {
     let biasedBody = String(decoding: biased.httpBody ?? Data(), as: UTF8.self)
     expect(biasedBody.contains("name=\"prompt\"\r\n\r\nGlossary: Murmur, Kyutai."),
            "prompt field carries the vocabulary biasing string")
+
+    // No key-down prewarm: whisper-server encodes a full 30 s window for any
+    // request and serves one request at a time, so on a warm server a
+    // prewarm delayed a 0.25 s dictation by 0.4 s.
+    let whisper = WhisperCppEngine(binaryPath: "/nonexistent/whisper-server",
+                                   modelPath: "/nonexistent/ggml.bin", port: 9999)
+    expectEqual(Prewarm.forDictation(engine: whisper, cleaner: nil, prompt: "Glossary: Murmur.").count, 0,
+                "key-down sends nothing to whisper-server")
 }
 
 // MARK: - LlamaCppChatEngine
@@ -244,6 +253,17 @@ do {
     expect(body["model"] == nil, "no model field — llama-server serves one model")
     expectEqual(body["cache_prompt"] as? Bool, true, "system-prefix KV cache reuse enabled")
 
+    // Key-down prewarm: the cleanup system prompt, so its prefix is cached,
+    // and one output token.
+    let warm = try! LlamaCppChatEngine.makePrewarmRequest(system: "You clean.", port: 8725)
+    expectEqual(warm.url?.absoluteString, "http://127.0.0.1:8725/v1/chat/completions", "prewarm hits the chat URL")
+    let warmBody = try! JSONSerialization.jsonObject(with: warm.httpBody ?? Data()) as! [String: Any]
+    let warmMessages = warmBody["messages"] as! [[String: String]]
+    expectEqual(warmMessages.count, 2, "prewarm sends the system prompt and a short user turn")
+    expectEqual(warmMessages[0]["content"], "You clean.", "prewarm carries the cleanup system prompt")
+    expectEqual(warmBody["max_tokens"] as? Int, 1, "prewarm asks for one token")
+    expectEqual(warmBody["cache_prompt"] as? Bool, true, "prewarm caches the system prefix")
+
     let healthReq = LlamaCppChatEngine.healthRequest(port: 8725)
     expectEqual(healthReq.url?.absoluteString, "http://127.0.0.1:8725/health", "health URL")
     expectEqual(healthReq.timeoutInterval, 1, "health probe is quick")
@@ -265,6 +285,575 @@ do {
            "binary-missing error names the remedy")
     expect(LlamaCppError.modelMissing("/y").errorDescription!.contains("install_llama.sh"),
            "model-missing error names the remedy")
+}
+
+// MARK: - ParakeetEngine
+
+section("ParakeetEngine")
+do {
+    let args = ParakeetEngine.serverArguments(modelPath: "/m/tdt.gguf", port: 8726)
+    func argValue(_ flag: String) -> String? {
+        guard let i = args.firstIndex(of: flag), i + 1 < args.count else { return nil }
+        return args[i + 1]
+    }
+    expectEqual(argValue("--model"), "/m/tdt.gguf", "server args pass the local model path")
+    expectEqual(argValue("--host"), "127.0.0.1", "server binds loopback only")
+    expectEqual(argValue("--port"), "8726", "server args include port")
+    expect(argValue("--threads").flatMap(Int.init) != nil, "thread count is numeric")
+    expect(!args.contains("--cache-dir"), "no model cache dir: the model is always a local file")
+
+    let request = ParakeetEngine.makeTranscriptionRequest(wav: Data([0xAB]), port: 9999)
+    expectEqual(request.url?.absoluteString, "http://127.0.0.1:9999/v1/audio/transcriptions",
+                "OpenAI-style transcription URL")
+    expectEqual(request.httpMethod, "POST", "transcription method")
+    expect(request.value(forHTTPHeaderField: "Content-Type")?.hasPrefix("multipart/form-data") == true,
+           "multipart content type")
+    expect(request.httpBody?.range(of: Data([0xAB])) != nil, "wav bytes in body")
+    let body = String(decoding: request.httpBody ?? Data(), as: UTF8.self)
+    expect(body.contains("name=\"file\"; filename=\"audio.wav\""), "wav sent as the file field")
+    expect(body.contains("name=\"response_format\"\r\n\r\njson"), "response_format json sent")
+    expect(!body.contains("name=\"prompt\""), "no prompt field (Parakeet ignores prompts)")
+    expectEqual(request.timeoutInterval, 60, "request timeout")
+
+    let warm = ParakeetEngine.makePrewarmRequest(port: 9999)
+    expectEqual(warm.url?.absoluteString, "http://127.0.0.1:9999/v1/audio/transcriptions", "prewarm hits the transcription URL")
+    expect(warm.httpBody?.range(of: Prewarm.silence) != nil, "prewarm sends the silent clip")
+
+    let health = ChildServer.healthRequest(port: 8726)
+    expectEqual(health.url?.absoluteString, "http://127.0.0.1:8726/health", "health URL")
+    expectEqual(health.timeoutInterval, 1, "health probe is quick")
+
+    // Port ownership: only the process actually listening counts.
+    let fd = socket(AF_INET, SOCK_STREAM, 0)
+    var addr = sockaddr_in()
+    addr.sin_family = sa_family_t(AF_INET)
+    addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+    addr.sin_port = 0
+    var len = socklen_t(MemoryLayout<sockaddr_in>.size)
+    let listening = withUnsafeMutablePointer(to: &addr) { p in
+        p.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+            bind(fd, $0, len) == 0 && listen(fd, 1) == 0 && getsockname(fd, $0, &len) == 0
+        }
+    }
+    let heldPort = Int(UInt16(bigEndian: addr.sin_port))
+    expect(listening, "test listener is up")
+    expect(ChildServer.listens(pid: getpid(), port: heldPort), "the listening process owns its port")
+    expect(!ChildServer.listens(pid: 1, port: heldPort), "another pid does not own the port")
+    close(fd)
+    expect(!ChildServer.listens(pid: getpid(), port: heldPort), "a closed port has no owner")
+
+    await {
+        // A child that exits (bad model, port taken) fails fast: no 30 s wait.
+        let quitter = FileManager.default.temporaryDirectory
+            .appendingPathComponent("child_quit_\(UUID().uuidString)")
+        FileManager.default.createFile(atPath: quitter.path, contents: Data("#!/bin/sh\nexit 1\n".utf8),
+                                       attributes: [.posixPermissions: 0o755])
+        defer { try? FileManager.default.removeItem(at: quitter) }
+        let port = LocalServer.freeLoopbackPort() ?? 18_792
+        let child = ChildServer(name: "quitter", binaryPath: quitter.path, port: port,
+                                session: LoopbackURLSession.make(resourceTimeout: 5)) { _ in [] }
+        defer { child.shutdown() }
+        let start = Date()
+        let ready = try? await child.ensureRunning(polls: 120) {}
+        expectEqual(ready, false, "a child that exits never reports ready")
+        expect(-start.timeIntervalSinceNow < 5, "exit detected in under 5 s (got \(String(format: "%.1f", -start.timeIntervalSinceNow)) s)")
+        // The port may belong to a process lsof cannot see (another user's),
+        // so the next start leaves it.
+        _ = try? await child.ensureRunning(polls: 120) {}
+        expect(child.port != port, "after a child exits before it is ready, the next start uses a fresh port")
+
+        // A squatter answering /health on the child's port is refused, and so
+        // is the "already running" shortcut for a child never verified.
+        let sleeper = FileManager.default.temporaryDirectory
+            .appendingPathComponent("child_sleep_\(UUID().uuidString)")
+        FileManager.default.createFile(atPath: sleeper.path, contents: Data("#!/bin/sh\nsleep 5\n".utf8),
+                                       attributes: [.posixPermissions: 0o755])
+        defer { try? FileManager.default.removeItem(at: sleeper) }
+        var squatter: FakeHealthResponder?
+        let victim = ChildServer(name: "sleeper", binaryPath: sleeper.path,
+                                 port: LocalServer.freeLoopbackPort() ?? 18_793,
+                                 session: LoopbackURLSession.make(resourceTimeout: 5)) { port in
+            squatter = FakeHealthResponder(port: port) // answers from this process, not the child
+            return []
+        }
+        defer { victim.shutdown(); squatter?.stop() }
+        let unpolled = try? await victim.ensureRunning(polls: 0) {}
+        expectEqual(unpolled, false, "no polls: spawned, not ready")
+        expect(squatter != nil, "squatter listens on the child's port")
+        let squatted = try? await victim.ensureRunning(polls: 8) {}
+        expectEqual(squatted, false, "a /health answer from another process is refused")
+
+        let squattedPort = victim.port
+        _ = try? await victim.ensureRunning(polls: 1) {}
+        expect(victim.port != squattedPort, "after refusing a squatter the next child gets a fresh port")
+        victim.shutdown()
+
+        // The same when the other process answers only after the child died.
+        var slowSquatter: FakeHealthResponder?
+        let dying = ChildServer(name: "dying", binaryPath: quitter.path,
+                                port: LocalServer.freeLoopbackPort() ?? 18_796,
+                                session: LoopbackURLSession.make(resourceTimeout: 5)) { port in
+            slowSquatter = FakeHealthResponder(port: port, delay: 0.4)
+            return []
+        }
+        defer { dying.shutdown(); slowSquatter?.stop() }
+        let dyingResult = try? await dying.ensureRunning(polls: 8) {}
+        expectEqual(dyingResult, false, "an answer that arrives after the child died is refused")
+        let dyingPort = dying.port
+        slowSquatter?.stop() // now it stands in for a holder lsof cannot see
+        _ = try? await dying.ensureRunning(polls: 1) {}
+        expect(dying.port != dyingPort, "after an answer from another process, the next start uses a fresh port")
+
+        // Concurrent callers (warm-up + dictation) start one child, not several.
+        let launches = FileManager.default.temporaryDirectory
+            .appendingPathComponent("child_launches_\(UUID().uuidString)")
+        let counter = FileManager.default.temporaryDirectory
+            .appendingPathComponent("child_count_\(UUID().uuidString)")
+        FileManager.default.createFile(atPath: counter.path,
+                                       contents: Data("#!/bin/sh\necho x >> '\(launches.path)'\nexec sleep 30\n".utf8),
+                                       attributes: [.posixPermissions: 0o755])
+        defer {
+            try? FileManager.default.removeItem(at: counter)
+            try? FileManager.default.removeItem(at: launches)
+        }
+        let shared = ChildServer(name: "counter", binaryPath: counter.path,
+                                 port: LocalServer.freeLoopbackPort() ?? 18_794,
+                                 session: LoopbackURLSession.make(resourceTimeout: 5)) { _ in [] }
+        defer { shared.shutdown() }
+        await withTaskGroup(of: Void.self) { group in
+            for _ in 0..<5 { group.addTask { _ = try? await shared.ensureRunning(polls: 2) {} } }
+        }
+        for _ in 0..<30 where !FileManager.default.fileExists(atPath: launches.path) {
+            try? await Task.sleep(nanoseconds: 100_000_000) // a launch line can land late under load
+        }
+        try? await Task.sleep(nanoseconds: 300_000_000)
+        let launched = (try? String(contentsOf: launches, encoding: .utf8))?
+            .split(separator: "\n").count ?? 0
+        expectEqual(launched, 1, "five concurrent callers launch the child once")
+        shared.shutdown()
+
+        // A shutdown while a caller polls: an answer that arrives afterwards on
+        // that port is never trusted (it cannot come from the stopped child).
+        var raceSquatter: FakeHealthResponder?
+        let raced = ChildServer(name: "raced", binaryPath: sleeper.path,
+                                port: LocalServer.freeLoopbackPort() ?? 18_795,
+                                session: LoopbackURLSession.make(resourceTimeout: 5)) { _ in [] }
+        defer { raced.shutdown(); raceSquatter?.stop() }
+        let polling = Task { try await raced.ensureRunning(polls: 40) {} }
+        try? await Task.sleep(nanoseconds: 1_000_000_000)
+        let racedPort = raced.port
+        raced.shutdown()
+        raceSquatter = FakeHealthResponder(port: racedPort)
+        expect(raceSquatter != nil, "squatter took the stopped child's port")
+        let racedResult = try? await polling.value
+        expectEqual(racedResult, false, "a caller never trusts an answer after its child was shut down")
+
+        // A shutdown that lands while a start is under way (app quit, engine
+        // switch) stops the child that start goes on to spawn.
+        let pidFile = FileManager.default.temporaryDirectory
+            .appendingPathComponent("child_pid_\(UUID().uuidString)")
+        let recorder = FileManager.default.temporaryDirectory
+            .appendingPathComponent("child_rec_\(UUID().uuidString)")
+        FileManager.default.createFile(atPath: recorder.path,
+                                       contents: Data("#!/bin/sh\necho $$ > '\(pidFile.path)'\nexec sleep 5\n".utf8),
+                                       attributes: [.posixPermissions: 0o755])
+        defer {
+            try? FileManager.default.removeItem(at: recorder)
+            try? FileManager.default.removeItem(at: pidFile)
+        }
+        let late = ChildServer(name: "late", binaryPath: recorder.path,
+                               port: LocalServer.freeLoopbackPort() ?? 18_797,
+                               session: LoopbackURLSession.make(resourceTimeout: 5)) { _ in [] }
+        defer { late.shutdown() }
+        let lateResult = try? await late.ensureRunning(polls: 4) { late.shutdown() }
+        expectEqual(lateResult, false, "a start overtaken by a shutdown is not ready")
+        try? await Task.sleep(nanoseconds: 300_000_000)
+        let latePID = (try? String(contentsOf: pidFile, encoding: .utf8))
+            .flatMap { pid_t($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
+        expect(latePID.map { kill($0, 0) != 0 } ?? true,
+               "the child spawned after the shutdown is stopped (pid \(latePID.map(String.init) ?? "none"))")
+
+        // A shutdown that lands during the ownership check (an lsof run) or
+        // during the quick health check of a verified child (a dictation chunk
+        // probing while the engine switches) wins: the call reports not ready.
+        let holder = FileManager.default.temporaryDirectory
+            .appendingPathComponent("child_hold_\(UUID().uuidString)")
+        FileManager.default.createFile(atPath: holder.path, contents: Data("#!/bin/sh\nexec sleep 30\n".utf8),
+                                       attributes: [.posixPermissions: 0o755])
+        defer { try? FileManager.default.removeItem(at: holder) }
+        var checkedRef: ChildServer?
+        var checkedResponder: FakeHealthResponder?
+        let checked = ChildServer(name: "checked", binaryPath: holder.path,
+                                  port: LocalServer.freeLoopbackPort() ?? 18_780,
+                                  session: LoopbackURLSession.make(resourceTimeout: 5),
+                                  owns: { _, _ in checkedRef?.shutdown(); return true }) { port in
+            checkedResponder = FakeHealthResponder(port: port)
+            return []
+        }
+        checkedRef = checked
+        defer { checked.shutdown(); checkedResponder?.stop() }
+        let checkedResult = try? await checked.ensureRunning(polls: 4) {}
+        expectEqual(checkedResult, false, "a shutdown during the ownership check wins")
+
+        var probedRef: ChildServer?
+        var probedResponder: FakeHealthResponder?
+        let probed = ChildServer(name: "probed", binaryPath: holder.path,
+                                 port: LocalServer.freeLoopbackPort() ?? 18_781,
+                                 session: LoopbackURLSession.make(resourceTimeout: 5),
+                                 owns: { _, _ in true }) { port in
+            probedResponder = FakeHealthResponder(port: port) { request in
+                if request == 2 { probedRef?.shutdown() }
+            }
+            return []
+        }
+        probedRef = probed
+        defer { probed.shutdown(); probedResponder?.stop() }
+        let probedFirst = try? await probed.ensureRunning(polls: 4) {}
+        expectEqual(probedFirst, true, "a child that answers and holds its port is ready")
+        let probedAgain = try? await probed.ensureRunning(polls: 4) {}
+        expectEqual(probedAgain, false, "a shutdown during the quick health check wins")
+
+        // A shutdown retires the server: a later start (a dictation chunk that
+        // was probing when the engine switched, a warm-up) launches nothing.
+        let retiredLaunches = FileManager.default.temporaryDirectory
+            .appendingPathComponent("child_launches_\(UUID().uuidString)")
+        let retiredCounter = FileManager.default.temporaryDirectory
+            .appendingPathComponent("child_count_\(UUID().uuidString)")
+        FileManager.default.createFile(atPath: retiredCounter.path,
+                                       contents: Data("#!/bin/sh\necho x >> '\(retiredLaunches.path)'\nexec sleep 30\n".utf8),
+                                       attributes: [.posixPermissions: 0o755])
+        defer {
+            try? FileManager.default.removeItem(at: retiredCounter)
+            try? FileManager.default.removeItem(at: retiredLaunches)
+        }
+        let retired = ChildServer(name: "retired", binaryPath: retiredCounter.path,
+                                  port: LocalServer.freeLoopbackPort() ?? 18_798,
+                                  session: LoopbackURLSession.make(resourceTimeout: 5)) { _ in [] }
+        defer { retired.shutdown() }
+        retired.shutdown()
+        let afterShutdown = try? await retired.ensureRunning(polls: 2) {}
+        expectEqual(afterShutdown, false, "a start after shutdown is not ready")
+        try? await Task.sleep(nanoseconds: 500_000_000)
+        let retiredLaunched = (try? String(contentsOf: retiredLaunches, encoding: .utf8))?
+            .split(separator: "\n").count ?? 0
+        expectEqual(retiredLaunched, 0, "a start after shutdown launches nothing")
+
+        // A child that fails only after its start gave up polling still sends
+        // the next start to a fresh port.
+        let slowQuitter = FileManager.default.temporaryDirectory
+            .appendingPathComponent("child_slowquit_\(UUID().uuidString)")
+        FileManager.default.createFile(atPath: slowQuitter.path, contents: Data("#!/bin/sh\nsleep 1\nexit 1\n".utf8),
+                                       attributes: [.posixPermissions: 0o755])
+        defer { try? FileManager.default.removeItem(at: slowQuitter) }
+        let slowPort = LocalServer.freeLoopbackPort() ?? 18_799
+        let slow = ChildServer(name: "slow-quitter", binaryPath: slowQuitter.path, port: slowPort,
+                               session: LoopbackURLSession.make(resourceTimeout: 5)) { _ in [] }
+        defer { slow.shutdown() }
+        let gaveUp = try? await slow.ensureRunning(polls: 1) {}
+        expectEqual(gaveUp, false, "polls ran out before the slow child failed")
+        try? await Task.sleep(nanoseconds: 1_500_000_000) // the child exits meanwhile
+        _ = try? await slow.ensureRunning(polls: 1) {}
+        expect(slow.port != slowPort,
+               "a child that failed after its start gave up still moves the next start to a fresh port")
+
+        expectEqual(LocalServer.parentPID(of: getpid()), getppid(), "parentPID reads the parent")
+        expect(LocalServer.parentPID(of: -1) == nil, "parentPID of an invalid pid is nil")
+
+        struct Refused: Error {}
+        var spawned = false
+        do {
+            _ = try await child.ensureRunning(polls: 1) { throw Refused() }
+            spawned = true
+        } catch {
+            expect(error is Refused, "preflight errors propagate unchanged")
+        }
+        expect(!spawned, "a failed preflight stops before spawning")
+    }()
+
+    expectEqual(try? ParakeetEngine.parseResponse(Data(#"{"text":"  Hello world. "}"#.utf8)),
+                "Hello world.", "response text parsed and trimmed")
+    expectEqual(try? ParakeetEngine.parseResponse(Data(#"{"text":""}"#.utf8)), "",
+                "empty transcript parses to an empty string")
+    for bad in [#"{"error":{"message":"bad wav"}}"#, #"{"text":null}"#, "not json"] {
+        expect((try? ParakeetEngine.parseResponse(Data(bad.utf8))) == nil, "bad payload throws: \(bad)")
+    }
+
+    let errors: [ParakeetError] = [.binaryMissing("/x"), .modelMissing("/y"), .serverTimeout,
+                                   .http(status: 500), .badResponse]
+    for error in errors {
+        expect(!(error.errorDescription ?? "").isEmpty, "error has a description: \(error)")
+    }
+    expect(ParakeetError.binaryMissing("/x").errorDescription!.contains("install_parakeet.sh"),
+           "binary-missing error names the remedy")
+    expect(ParakeetError.modelMissing("/y").errorDescription!.contains("install_parakeet.sh"),
+           "model-missing error names the remedy")
+
+    // Preflight fails fast, before any process is spawned.
+    await {
+        let missingBinary = ParakeetEngine(binaryPath: "/nonexistent/parakeet-server",
+                                           modelPath: "/nonexistent/m.gguf", port: 18_790)
+        do {
+            _ = try await missingBinary.transcribe(wav: Data([0]))
+            expect(false, "missing binary must throw")
+        } catch ParakeetError.binaryMissing(let path) {
+            expectEqual(path, "/nonexistent/parakeet-server", "binaryMissing carries the path")
+        } catch {
+            expect(false, "missing binary threw \(error)")
+        }
+
+        let fakeBinary = FileManager.default.temporaryDirectory
+            .appendingPathComponent("pk_fake_\(UUID().uuidString)")
+        FileManager.default.createFile(atPath: fakeBinary.path, contents: Data("#!/bin/sh\nexit 1\n".utf8),
+                                       attributes: [.posixPermissions: 0o755])
+        defer { try? FileManager.default.removeItem(at: fakeBinary) }
+        let missingModel = ParakeetEngine(binaryPath: fakeBinary.path,
+                                          modelPath: "/nonexistent/m.gguf", port: 18_790)
+        do {
+            _ = try await missingModel.transcribe(wav: Data([0]))
+            expect(false, "missing model must throw")
+        } catch ParakeetError.modelMissing(let path) {
+            expectEqual(path, "/nonexistent/m.gguf", "modelMissing carries the path")
+        } catch {
+            expect(false, "missing model threw \(error)")
+        }
+    }()
+}
+
+// MARK: - AudioChunker
+
+section("AudioChunker")
+do {
+    // 1 s of tone, then a 0.5 s pause, repeated: quiet stretches at known spots.
+    let rate = 16_000
+    var samples: [Int16] = []
+    for _ in 0..<50 {
+        samples += (0..<rate).map { Int16(8_000 * sin(Double($0) * 0.3)) }
+        samples += [Int16](repeating: 0, count: rate / 2)
+    }
+    let total = samples.count // 75 s
+    let cuts = AudioChunker.cutPoints(samples: samples, sampleRate: rate, maxSeconds: 20, searchSeconds: 5)
+    expect(!cuts.isEmpty, "75 s of audio is cut at 20 s limits")
+    let bounds = [0] + cuts + [total]
+    let lengths = zip(bounds, bounds.dropFirst()).map { $1 - $0 }
+    expect(lengths.allSatisfy { $0 > 0 && $0 <= 20 * rate }, "every chunk is non-empty and at most 20 s: \(lengths)")
+    expect(cuts.allSatisfy { samples[$0] == 0 }, "every cut lands in a pause")
+    expectEqual(lengths.reduce(0, +), total, "chunks cover every sample exactly once")
+
+    expect(AudioChunker.cutPoints(samples: samples, sampleRate: rate, maxSeconds: 80, searchSeconds: 5).isEmpty,
+           "audio under the limit is not cut")
+    let steady = [Int16](repeating: 1_000, count: 45 * rate)
+    let steadyCuts = AudioChunker.cutPoints(samples: steady, sampleRate: rate, maxSeconds: 20, searchSeconds: 5)
+    let steadyBounds = [0] + steadyCuts + [steady.count]
+    expect(zip(steadyBounds, steadyBounds.dropFirst()).allSatisfy { $1 - $0 > 0 && $1 - $0 <= 20 * rate },
+           "audio with no pause is still cut within the limit")
+
+    let wav = WAVEncoder.encode(samples: samples, sampleRate: UInt32(rate))
+    let pieces = AudioChunker.split(wav: wav, maxSeconds: 20, searchSeconds: 5)
+    expectEqual(pieces.count, cuts.count + 1, "split returns one WAV per chunk")
+    expectEqual(pieces.map { ($0.count - 44) / 2 }, lengths, "each WAV holds its chunk's samples")
+    expect(pieces.allSatisfy { $0.prefix(4) == Data("RIFF".utf8) && $0.count > 44 }, "each piece is a WAV")
+    if let first = pieces.first {
+        let decoded = first.subdata(in: 44..<first.count).withUnsafeBytes { Array($0.bindMemory(to: Int16.self)) }
+        expectEqual(decoded, Array(samples[0..<cuts[0]]), "first piece carries the first chunk verbatim")
+    }
+    let short = WAVEncoder.encode(samples: [Int16](repeating: 5, count: rate), sampleRate: UInt32(rate))
+    expectEqual(AudioChunker.split(wav: short, maxSeconds: 20), [short], "short audio comes back unchanged")
+    let notWav = Data("definitely not a wav file, just bytes".utf8)
+    expectEqual(AudioChunker.split(wav: notWav, maxSeconds: 1), [notWav], "unknown bytes come back unchanged")
+
+    // Just over the limit with the only pause right at it: the remainder must
+    // not become a sliver the model would hallucinate on.
+    var edge = (0..<(60 * rate + 801)).map { Int16(8_000 * sin(Double($0) * 0.3)) }
+    for i in (60 * rate - rate / 10)..<(60 * rate) { edge[i] = 0 }
+    let edgeCuts = AudioChunker.cutPoints(samples: edge, sampleRate: rate, maxSeconds: 60, searchSeconds: 8)
+    let edgeBounds = [0] + edgeCuts + [edge.count]
+    let edgeLengths = zip(edgeBounds, edgeBounds.dropFirst()).map { $1 - $0 }
+    expect(edgeLengths.allSatisfy { $0 >= rate && $0 <= 60 * rate },
+           "a remainder just over the limit leaves chunks of at least 1 s: \(edgeLengths)")
+
+    // A limit shorter than the search window must not shred the audio.
+    let quiet = [Int16](repeating: 0, count: 60 * rate)
+    let quietCuts = AudioChunker.cutPoints(samples: quiet, sampleRate: rate, maxSeconds: 5, searchSeconds: 8)
+    let quietBounds = [0] + quietCuts + [quiet.count]
+    let quietLengths = zip(quietBounds, quietBounds.dropFirst()).map { $1 - $0 }
+    expect(quietLengths.count <= 25 && quietLengths.allSatisfy { $0 >= rate && $0 <= 5 * rate },
+           "5 s limit with an 8 s search window: at most 25 chunks of 1-5 s (got \(quietLengths.count))")
+    for bad in [Double.nan, .infinity, 0, -3] {
+        expect(AudioChunker.cutPoints(samples: quiet, sampleRate: rate, maxSeconds: bad, searchSeconds: 8).isEmpty,
+               "maxSeconds \(bad) cuts nothing (and does not crash)")
+    }
+    expect(AudioChunker.cutPoints(samples: quiet, sampleRate: rate, maxSeconds: 20, searchSeconds: .nan).count == 2,
+           "a non-finite search window falls back to cutting at the limit")
+
+    // Chunked transcription: pieces are joined in order, empty ones dropped,
+    // and one failure per piece is retried.
+    struct Flaky: Error {}
+    await {
+        let three = WAVEncoder.encode(samples: Array(quiet.prefix(50 * rate)), sampleRate: UInt32(rate))
+        expectEqual(AudioChunker.split(wav: three, maxSeconds: 20).count, 3, "50 s at a 20 s limit is 3 pieces")
+        var calls = 0
+        var failedOnce = false
+        let joined = try? await AudioChunker.transcribe(wav: three, maxSeconds: 20) { piece in
+            calls += 1
+            if calls == 2 && !failedOnce { failedOnce = true; throw Flaky() }
+            return calls == 3 ? "" : "part\(calls)"
+        }
+        expectEqual(joined, "part1 part4", "pieces joined in order, the empty one dropped")
+        expectEqual(calls, 4, "the failed piece was retried once")
+
+        var attempts = 0
+        do {
+            _ = try await AudioChunker.transcribe(wav: three, maxSeconds: 20) { _ in
+                attempts += 1
+                throw Flaky()
+            }
+            expect(false, "a piece that fails twice must throw")
+        } catch {
+            expect(error is Flaky, "the second failure propagates")
+        }
+        expectEqual(attempts, 2, "a failing piece is tried exactly twice")
+
+        // A cancelled dictation stops at once: its piece is not retried.
+        let cancelled = Task { () -> Int in
+            var tries = 0
+            _ = try? await AudioChunker.transcribe(wav: three, maxSeconds: 20) { _ in
+                tries += 1
+                withUnsafeCurrentTask { $0?.cancel() }
+                throw CancellationError()
+            }
+            return tries
+        }
+        expectEqual(await cancelled.value, 1, "a cancelled transcription is not retried")
+    }()
+}
+
+// MARK: - QwenAsrEngine
+
+section("QwenAsrEngine")
+do {
+    let args = QwenAsrEngine.serverArguments(modelPath: "/m/asr.gguf", mmprojPath: "/m/mmproj.gguf", port: 8727)
+    func argValue(_ flag: String) -> String? {
+        guard let i = args.firstIndex(of: flag), i + 1 < args.count else { return nil }
+        return args[i + 1]
+    }
+    expectEqual(argValue("-m"), "/m/asr.gguf", "server args include the model")
+    expectEqual(argValue("--mmproj"), "/m/mmproj.gguf", "server args include the audio projector")
+    expectEqual(argValue("--host"), "127.0.0.1", "server binds loopback only")
+    expectEqual(argValue("--port"), "8727", "server args include port")
+    expectEqual(argValue("-c"), "4096", "context fits a 60 s chunk plus the vocabulary prompt")
+    expectEqual(argValue("-ngl"), "99", "full Metal offload")
+    expect(argValue("-t").flatMap(Int.init) != nil, "thread count is numeric")
+
+    let wav = WAVEncoder.encode(samples: [Int16](repeating: 0, count: 16_000 * 10), sampleRate: 16_000)
+    let request = try! QwenAsrEngine.makeTranscriptionRequest(
+        wav: wav, prompt: "The transcript may include these terms: PyTorch.", language: "en", port: 9999)
+    expectEqual(request.url?.absoluteString, "http://127.0.0.1:9999/v1/chat/completions", "chat URL")
+    expectEqual(request.httpMethod, "POST", "chat method")
+    expectEqual(request.value(forHTTPHeaderField: "Content-Type"), "application/json", "JSON content type")
+    expectEqual(request.timeoutInterval, 60, "request timeout")
+    let body = try! JSONSerialization.jsonObject(with: request.httpBody ?? Data()) as! [String: Any]
+    let messages = body["messages"] as! [[String: Any]]
+    expectEqual(messages.count, 3, "system context + audio + language prefill")
+    expectEqual(messages[0]["role"] as? String, "system", "vocabulary goes in as the system message")
+    expectEqual(messages[0]["content"] as? String, "The transcript may include these terms: PyTorch.",
+                "system message carries the vocabulary prompt verbatim")
+    expectEqual(messages[1]["role"] as? String, "user", "audio is the user turn")
+    let parts = messages[1]["content"] as? [[String: Any]] ?? []
+    expectEqual(parts.first?["type"] as? String, "input_audio", "audio sent as input_audio")
+    let audio = parts.first?["input_audio"] as? [String: String]
+    expectEqual(audio?["format"], "wav", "audio format wav")
+    expectEqual(audio?["data"].flatMap { Data(base64Encoded: $0) }, wav, "audio data is the base64 WAV")
+    expectEqual(messages[2]["role"] as? String, "assistant", "assistant turn is prefilled")
+    expectEqual(messages[2]["content"] as? String, "language English<asr_text>",
+                "prefill pins the configured language")
+    expectEqual(body["temperature"] as? Double, 0, "temperature 0")
+    expectEqual(body["cache_prompt"] as? Bool, true, "vocabulary prefix KV cache reuse enabled")
+    expectEqual(body["max_tokens"] as? Int, 144, "10 s of audio caps output at 144 tokens")
+    expect(body["model"] == nil, "no model field (llama-server serves one model)")
+
+    let bare = try! QwenAsrEngine.makeTranscriptionRequest(wav: wav, prompt: nil, language: "xx", port: 9999)
+    let bareMessages = (try! JSONSerialization.jsonObject(with: bare.httpBody!) as! [String: Any])["messages"]
+        as! [[String: Any]]
+    expectEqual(bareMessages.count, 1, "no prompt and an unknown language → audio turn only")
+    expectEqual(bareMessages[0]["role"] as? String, "user", "audio turn only")
+
+    // Key-down prewarm: the next request's prompt and prefill, the silent
+    // clip, one output token.
+    let warm = try! QwenAsrEngine.makePrewarmRequest(
+        prompt: "The transcript may include these terms: PyTorch.", language: "en", port: 9999)
+    expectEqual(warm.url?.absoluteString, "http://127.0.0.1:9999/v1/chat/completions", "prewarm hits the chat URL")
+    let warmBody = try! JSONSerialization.jsonObject(with: warm.httpBody ?? Data()) as! [String: Any]
+    let warmMessages = warmBody["messages"] as! [[String: Any]]
+    expectEqual(warmMessages.count, 3, "prewarm keeps the system context, audio and prefill")
+    expectEqual(warmMessages[0]["content"] as? String, "The transcript may include these terms: PyTorch.",
+                "prewarm carries the vocabulary prompt, so the server caches its prefix")
+    let warmParts = warmMessages[1]["content"] as? [[String: Any]] ?? []
+    let warmAudio = (warmParts.first?["input_audio"] as? [String: String])?["data"]
+    expectEqual(warmAudio.flatMap { Data(base64Encoded: $0) }, Prewarm.silence, "prewarm sends the silent clip")
+    expectEqual(warmMessages[2]["content"] as? String, "language English<asr_text>", "prewarm keeps the language prefill")
+    expectEqual(warmBody["max_tokens"] as? Int, 1, "prewarm asks for one token")
+    expectEqual(warmBody["cache_prompt"] as? Bool, true, "prewarm caches the prompt prefix")
+
+    expectEqual(QwenAsrEngine.languageName(for: "en"), "English", "en → English")
+    expectEqual(QwenAsrEngine.languageName(for: "vi"), "Vietnamese", "vi → Vietnamese")
+    expectEqual(QwenAsrEngine.languageName(for: "EN"), "English", "codes are case-insensitive")
+    expect(QwenAsrEngine.languageName(for: "auto") == nil, "auto lets the model detect the language")
+
+    expectEqual(QwenAsrEngine.maxTokens(forWAVBytes: 44), 64, "empty audio still gets a small budget")
+    expectEqual(QwenAsrEngine.maxTokens(forWAVBytes: 44 + 32_000 * 60), 544, "60 s chunk caps output at 544 tokens")
+
+    func parsed(_ content: String) -> String? {
+        let json = try! JSONSerialization.data(withJSONObject: ["choices": [["message": ["content": content]]]])
+        return try? QwenAsrEngine.parseResponse(json)
+    }
+    expectEqual(parsed("language English<asr_text>Hello there. "), "Hello there.", "language tag stripped")
+    expectEqual(parsed("language None<asr_text>"), "", "no speech → empty transcript")
+    expectEqual(parsed("Plain text without a tag"), "Plain text without a tag", "untagged content kept")
+    expectEqual(parsed("language English<asr_text>Done.</asr_text>"), "Done.", "closing tag stripped")
+    for bad in [#"{"choices":[]}"#, #"{"choices":[{"message":{"content":null}}]}"#, "not json"] {
+        expect((try? QwenAsrEngine.parseResponse(Data(bad.utf8))) == nil, "bad payload throws: \(bad)")
+    }
+
+    let errors: [QwenAsrError] = [.binaryMissing("/x"), .modelMissing("/y"), .serverTimeout,
+                                  .http(status: 500), .badResponse]
+    for error in errors {
+        expect(!(error.errorDescription ?? "").isEmpty, "error has a description: \(error)")
+    }
+    expect(QwenAsrError.modelMissing("/y").errorDescription!.contains("install_qwen_asr.sh"),
+           "model-missing error names the remedy")
+    expect(QwenAsrError.binaryMissing("/x").errorDescription!.contains("install_qwen_asr.sh"),
+           "binary-missing error names the remedy")
+
+    await {
+        let fakeBinary = FileManager.default.temporaryDirectory
+            .appendingPathComponent("qwen_fake_\(UUID().uuidString)")
+        FileManager.default.createFile(atPath: fakeBinary.path, contents: Data("#!/bin/sh\nexit 1\n".utf8),
+                                       attributes: [.posixPermissions: 0o755])
+        defer { try? FileManager.default.removeItem(at: fakeBinary) }
+        let model = FileManager.default.temporaryDirectory.appendingPathComponent("qwen_model_\(UUID().uuidString)")
+        FileManager.default.createFile(atPath: model.path, contents: Data([0]))
+        defer { try? FileManager.default.removeItem(at: model) }
+        let missingProjector = QwenAsrEngine(binaryPath: fakeBinary.path, modelPath: model.path,
+                                             mmprojPath: "/nonexistent/mmproj.gguf", port: 18_791)
+        do {
+            _ = try await missingProjector.transcribe(wav: wav, prompt: nil)
+            expect(false, "missing projector must throw")
+        } catch QwenAsrError.modelMissing(let path) {
+            expectEqual(path, "/nonexistent/mmproj.gguf", "modelMissing names the missing projector")
+        } catch {
+            expect(false, "missing projector threw \(error)")
+        }
+        let missingBinary = QwenAsrEngine(binaryPath: "/nonexistent/llama-server", modelPath: model.path,
+                                          mmprojPath: model.path, port: 18_791)
+        do {
+            _ = try await missingBinary.transcribe(wav: wav, prompt: nil)
+            expect(false, "missing binary must throw")
+        } catch QwenAsrError.binaryMissing(let path) {
+            expectEqual(path, "/nonexistent/llama-server", "binaryMissing carries the path")
+        } catch {
+            expect(false, "missing binary threw \(error)")
+        }
+    }()
 }
 
 // MARK: - VocabularyPrompt
@@ -1053,10 +1642,14 @@ do {
 
 section("Config & EngineKind")
 do {
-    expectEqual(EngineKind.allCases.count, 3, "three engines registered")
+    expectEqual(EngineKind.allCases.count, 5, "five engines registered")
     expect(EngineKind.groq.isLocal == false, "groq is cloud")
     expect(EngineKind.whisperCpp.isLocal, "whisper is local")
     expect(EngineKind.kyutai.isLocal, "kyutai is local")
+    expect(EngineKind.parakeet.isLocal, "parakeet is local")
+    expectEqual(EngineKind.parakeet.rawValue, "parakeet", "parakeet config value")
+    expect(EngineKind.qwenAsr.isLocal, "qwen3-asr is local")
+    expectEqual(EngineKind.qwenAsr.rawValue, "qwenAsr", "qwen3-asr config value")
     for kind in EngineKind.allCases {
         expect(!kind.displayName.isEmpty, "\(kind.rawValue) has a display name")
         expect(EngineKind(rawValue: kind.rawValue) == kind, "\(kind.rawValue) rawValue round-trips")
@@ -1085,6 +1678,16 @@ do {
     expect(c.kyutaiBinaryPath.contains("moshi-server"), "default kyutai binary path")
     expect(c.kyutaiConfigPath == nil, "default kyutai config path is app-managed (nil)")
     expectEqual(c.engine, .whisperCpp, "default engine is local whisper.cpp")
+    expectEqual(c.parakeetPort, 8726, "default parakeet port")
+    expect(c.parakeetBinaryPath.hasSuffix("/parakeet-server"), "default parakeet binary path")
+    expect(c.parakeetModelPath.hasSuffix("parakeet-tdt-0.6b-v2-q8_0.gguf"),
+           "default parakeet model is TDT 0.6B v2 q8_0")
+    expectEqual(c.qwenAsrPort, 8727, "default qwen3-asr port")
+    expect(c.qwenAsrModelPath.hasSuffix("Qwen3-ASR-0.6B-Q8_0.gguf"), "default qwen3-asr model is 0.6B Q8_0")
+    expect(c.qwenAsrMmprojPath.hasSuffix("mmproj-Qwen3-ASR-0.6B-Q8_0.gguf"),
+           "default qwen3-asr projector matches the model")
+    expect(Set([c.whisperPort, c.llamaPort, c.kyutaiPort, c.parakeetPort, c.qwenAsrPort]).count == 5,
+           "default local server ports are distinct")
     expect(c.whisperModelPath.contains("large-v3-turbo"), "default whisper model is large-v3-turbo")
 
     // Context-aware vocabulary selection: user terms first, builtin appended
@@ -1212,6 +1815,131 @@ await {
                                   vocabulary: ["PyTorch"])
         .cleanOrFallback("install pie torch before the workshop")
     expectEqual(termFixed, "Install PyTorch before the workshop.", "Cleaner keeps a vocabulary repair")
+}()
+
+// MARK: - Prewarm (key-down warm-up of the local models)
+
+section("Prewarm")
+
+expectEqual(Prewarm.silence, WAVEncoder.encode(samples: [Int16](repeating: 0, count: 16_000), sampleRate: 16_000),
+            "prewarm audio is one second of 16 kHz silence")
+
+/// A local chat engine that records what it was asked to warm.
+final class PrewarmChat: ChatEngine, Prewarmable {
+    var systems: [String] = []
+    var prewarmed: [String?] = []
+    func chatComplete(system: String, user: String, maxTokens: Int) async throws -> String {
+        systems.append(system)
+        return "Deploy to Vercel now please."
+    }
+    func prewarm(prompt: String?) -> Task<Bool, Never> {
+        prewarmed.append(prompt)
+        return Task { true }
+    }
+}
+
+/// A local STT engine that records what it was asked to warm.
+final class PrewarmSTT: TranscriptionEngine, Prewarmable {
+    var prompts: [String?] = []
+    func transcribe(wav: Data, prompt: String?) async throws -> String { "" }
+    func prewarm(prompt: String?) -> Task<Bool, Never> {
+        prompts.append(prompt)
+        return Task { true }
+    }
+}
+
+/// An engine with no local server to warm (cloud STT).
+final class RemoteSTT: TranscriptionEngine {
+    func transcribe(wav: Data, prompt: String?) async throws -> String { "" }
+}
+
+await {
+    let chat = PrewarmChat()
+    let cleaner = Cleaner(chat: chat, vocabulary: ["Vercel"])
+    expectEqual(await cleaner.prewarm()?.value, true, "Cleaner.prewarm returns the chat engine's task")
+    _ = await cleaner.cleanOrFallback("deploy to vercel now please")
+    expectEqual(chat.systems.count, 1, "cleanup ran once")
+    expectEqual(chat.prewarmed, chat.systems.map { Optional($0) },
+                "prewarm sends the exact system prompt the cleanup request uses")
+    expect(Cleaner(chat: MockChat(result: .success("x"))).prewarm() == nil,
+           "a chat engine without a local server (Groq) is not warmed")
+
+    let stt = PrewarmSTT()
+    let both = PrewarmChat()
+    let tasks = Prewarm.forDictation(engine: stt, cleaner: Cleaner(chat: both), prompt: "Terms: PyTorch.")
+    for task in tasks { _ = await task.value }
+    expectEqual(tasks.count, 2, "key-down warms the STT engine and the cleanup model")
+    expectEqual(stt.prompts, ["Terms: PyTorch."], "the STT prewarm carries the dictation's vocabulary prompt")
+    expectEqual(both.prewarmed.count, 1, "the cleanup model is warmed once")
+
+    let remoteOnly = PrewarmChat()
+    expectEqual(Prewarm.forDictation(engine: RemoteSTT(), cleaner: Cleaner(chat: remoteOnly), prompt: nil).count, 1,
+                "an engine without a local server is skipped")
+    let sttOnly = PrewarmSTT()
+    expectEqual(Prewarm.forDictation(engine: sttOnly, cleaner: nil, prompt: nil).count, 1,
+                "cleanup off: only the STT engine is warmed")
+    expectEqual(Prewarm.forDictation(engine: nil, cleaner: nil, prompt: nil).count, 0, "no engine: nothing to warm")
+
+    // A prewarm goes through the same server checks as a real request: with
+    // no verified server it sends nothing, so the vocabulary prompt never
+    // reaches a foreign process squatting the preferred port.
+    let quitter = FileManager.default.temporaryDirectory
+        .appendingPathComponent("prewarm_quit_\(UUID().uuidString)")
+    FileManager.default.createFile(atPath: quitter.path, contents: Data("#!/bin/sh\nexit 1\n".utf8),
+                                   attributes: [.posixPermissions: 0o755])
+    defer { try? FileManager.default.removeItem(at: quitter) }
+    let model = FileManager.default.temporaryDirectory.appendingPathComponent("prewarm_model_\(UUID().uuidString)")
+    FileManager.default.createFile(atPath: model.path, contents: Data([0]))
+    defer { try? FileManager.default.removeItem(at: model) }
+    final class Hits { var value = 0 }
+    let hits = Hits()
+    let squatPort = LocalServer.freeLoopbackPort() ?? 18_782
+    let squatter = FakeHealthResponder(port: squatPort) { _ in hits.value += 1 }
+    defer { squatter?.stop() }
+    expect(squatter != nil, "squatter listens on the preferred port")
+    let qwen = QwenAsrEngine(binaryPath: quitter.path, modelPath: model.path, mmprojPath: model.path,
+                             port: squatPort)
+    defer { qwen.shutdown() }
+    expectEqual(await qwen.prewarm(prompt: "Terms: Secret.").value, false,
+                "a Qwen prewarm with no verified server reports false")
+    let parakeet = ParakeetEngine(binaryPath: quitter.path, modelPath: model.path, port: squatPort)
+    defer { parakeet.shutdown() }
+    expectEqual(await parakeet.prewarm(prompt: nil).value, false,
+                "a Parakeet prewarm with no verified server reports false")
+    let llama = LlamaCppChatEngine(binaryPath: quitter.path, modelPath: model.path, port: squatPort)
+    defer { llama.shutdown() }
+    expectEqual(await llama.prewarm(prompt: "System: Secret.").value, false,
+                "a cleanup prewarm with no verified server reports false")
+    expectEqual(hits.value, 0, "no prewarm request reaches a squatter on the preferred port")
+
+    // Read-ahead: llama-server maps its model file, so weights evicted while
+    // the server idles come back one GPU page fault at a time; one sequential
+    // read of the missing parts brings them back at disk speed.
+    let weights = FileManager.default.temporaryDirectory
+        .appendingPathComponent("prewarm_weights_\(UUID().uuidString).gguf")
+    FileManager.default.createFile(atPath: weights.path, contents: Data(repeating: 0x5A, count: 32 << 20))
+    defer { try? FileManager.default.removeItem(at: weights) }
+    evictFromPageCache(weights.path)
+    expect(pageCacheFraction(weights.path) < 0.1, "test file starts out of the page cache")
+    expect(Prewarm.readAhead(weights.path), "read-ahead accepted for an existing file")
+    expect(pageCacheFraction(weights.path) > 0.99,
+           "read-ahead brings the whole file into the page cache (got \(pageCacheFraction(weights.path)))")
+    expect(!Prewarm.readAhead("/nonexistent/model.gguf"), "read-ahead of a missing file reports false")
+
+    // The llama-server engines read their model file ahead on every prewarm,
+    // whether or not the server answers.
+    evictFromPageCache(weights.path)
+    let qwenWeights = QwenAsrEngine(binaryPath: quitter.path, modelPath: weights.path, mmprojPath: model.path,
+                                    port: LocalServer.freeLoopbackPort() ?? 18_783)
+    defer { qwenWeights.shutdown() }
+    _ = await qwenWeights.prewarm(prompt: nil).value
+    expect(pageCacheFraction(weights.path) > 0.99, "a Qwen3-ASR prewarm reads the model file ahead")
+    evictFromPageCache(weights.path)
+    let llamaWeights = LlamaCppChatEngine(binaryPath: quitter.path, modelPath: weights.path,
+                                          port: LocalServer.freeLoopbackPort() ?? 18_784)
+    defer { llamaWeights.shutdown() }
+    _ = await llamaWeights.prewarm(prompt: nil).value
+    expect(pageCacheFraction(weights.path) > 0.99, "a cleanup prewarm reads the model file ahead")
 }()
 
 // MARK: - CleanupGuard (verbatim fidelity of the cleanup LLM)
@@ -1393,6 +2121,93 @@ do {
 
 // MARK: - Integration fixture (say → 16 kHz WAV through OUR encoder)
 
+/// Answers every loopback HTTP request on `port` with 200 from this test
+/// process: a stand-in for a foreign server squatting a child's port.
+final class FakeHealthResponder {
+    private let source: DispatchSourceRead
+
+    /// `delay` holds each reply back, so it can land after a child exited.
+    /// `onRequest` runs before each reply with the request's 1-based number.
+    init?(port: Int, delay: TimeInterval = 0, onRequest: ((Int) -> Void)? = nil) {
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        guard fd >= 0 else { return nil }
+        var yes: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
+        var addr = sockaddr_in()
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+        addr.sin_port = in_port_t(UInt16(port).bigEndian)
+        let bound = withUnsafePointer(to: &addr) { p in
+            p.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) == 0
+            }
+        }
+        guard bound, listen(fd, 8) == 0 else {
+            close(fd)
+            return nil
+        }
+        source = DispatchSource.makeReadSource(fileDescriptor: fd,
+                                               queue: DispatchQueue(label: "fake-health"))
+        final class Count { var value = 0 }
+        let requests = Count()
+        source.setEventHandler {
+            let client = accept(fd, nil, nil)
+            guard client >= 0 else { return }
+            var request = [UInt8](repeating: 0, count: 4096)
+            _ = read(client, &request, request.count)
+            requests.value += 1
+            onRequest?(requests.value)
+            if delay > 0 { Thread.sleep(forTimeInterval: delay) }
+            let reply = Array("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".utf8)
+            _ = reply.withUnsafeBytes { write(client, $0.baseAddress, $0.count) }
+            close(client)
+        }
+        source.setCancelHandler { close(fd) }
+        source.resume()
+    }
+
+    func stop() { source.cancel() }
+}
+
+/// Fraction of `path`'s pages in the page cache (mincore over a fresh mapping).
+func pageCacheFraction(_ path: String) -> Double {
+    let fd = open(path, O_RDONLY)
+    guard fd >= 0 else { return 0 }
+    defer { close(fd) }
+    var info = stat()
+    guard fstat(fd, &info) == 0, info.st_size > 0,
+          let map = mmap(nil, Int(info.st_size), PROT_READ, MAP_SHARED, fd, 0), map != MAP_FAILED else { return 0 }
+    defer { munmap(map, Int(info.st_size)) }
+    let page = Int(getpagesize())
+    var resident = [CChar](repeating: 0, count: (Int(info.st_size) + page - 1) / page)
+    guard mincore(map, Int(info.st_size), &resident) == 0 else { return 0 }
+    return Double(resident.filter { $0 & 1 != 0 }.count) / Double(resident.count)
+}
+
+/// Drops `path`'s clean pages from the page cache (msync MS_INVALIDATE, as
+/// `vmtouch -e` does on macOS), the state memory pressure leaves it in.
+func evictFromPageCache(_ path: String) {
+    let fd = open(path, O_RDONLY)
+    guard fd >= 0 else { return }
+    defer { close(fd) }
+    fsync(fd)
+    var info = stat()
+    guard fstat(fd, &info) == 0, info.st_size > 0,
+          let map = mmap(nil, Int(info.st_size), PROT_READ, MAP_SHARED, fd, 0), map != MAP_FAILED else { return }
+    msync(map, Int(info.st_size), MS_INVALIDATE)
+    munmap(map, Int(info.st_size))
+}
+
+/// The fixture sentence at the start and again at the end of `seconds` of
+/// audio, silence between: long enough to cross an engine's chunk limit.
+func buildLongFixtureWAV(seconds: Double) throws -> Data {
+    let fixture = try buildFixtureWAV()
+    let speech = fixture.subdata(in: 44..<fixture.count)
+        .withUnsafeBytes { Array($0.bindMemory(to: Int16.self)) }
+    let gap = max(0, Int(seconds * 16_000) - 2 * speech.count)
+    return WAVEncoder.encode(samples: speech + [Int16](repeating: 0, count: gap) + speech, sampleRate: 16_000)
+}
+
 func buildFixtureWAV() throws -> Data {
     let dir = FileManager.default.temporaryDirectory
     let pid = ProcessInfo.processInfo.processIdentifier
@@ -1513,10 +2328,248 @@ do {
     } else { expect(false, "freeLoopbackPort returned nil") }
 }
 
+// MARK: - install scripts (fake downloads)
+
+/// Stands in for curl in the installer tests: honors `-o` and `-C -` (resume;
+/// HTTP 416, exit 22, once nothing is left to send, as real curl does), serves
+/// $FAKE_CURL_BODY for model URLs and copies $FAKE_TARBALL for the release.
+/// $FAKE_CURL_FAIL makes it write 4 bytes and exit with that code.
+let fakeCurl = """
+    #!/bin/bash
+    out=""; resume=0; url=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -o) out="$2"; shift 2 ;;
+            -C) resume=1; shift 2 ;;
+            --retry|--retry-delay) shift 2 ;;
+            -*) shift ;;
+            *) url="$1"; shift ;;
+        esac
+    done
+    case "$url" in *.tar.gz) cp "$FAKE_TARBALL" "$out"; exit 0 ;; esac
+    have=0
+    if [ "$resume" = 1 ] && [ -f "$out" ]; then have=$(wc -c < "$out" | tr -d ' '); else : > "$out"; fi
+    if [ -n "${FAKE_CURL_FAIL:-}" ]; then
+        printf '%s' "${FAKE_CURL_BODY:$have:4}" >> "$out"; exit "$FAKE_CURL_FAIL"
+    fi
+    if [ "$have" -gt 0 ] && [ "$have" -ge "${#FAKE_CURL_BODY}" ]; then exit 22; fi
+    printf '%s' "${FAKE_CURL_BODY:$have}" >> "$out"
+
+    """
+
+/// Runs `scripts/<name>` with a throwaway HOME and `bin` first on PATH.
+func runInstaller(_ name: String, home: URL, bin: URL,
+                  env: [String: String]) -> (status: Int32, output: String) {
+    let repo = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+        .deletingLastPathComponent().deletingLastPathComponent()
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/bin/bash")
+    process.arguments = [repo.appendingPathComponent("scripts/\(name)").path]
+    process.environment = ["HOME": home.path, "TMPDIR": NSTemporaryDirectory(),
+                           "PATH": "\(bin.path):/usr/bin:/bin:/usr/sbin:/sbin"].merging(env) { $1 }
+    let pipe = Pipe()
+    process.standardOutput = pipe
+    process.standardError = pipe
+    do { try process.run() } catch { return (-1, "\(error)") }
+    let output = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+    process.waitUntilExit()
+    return (process.terminationStatus, output)
+}
+
+func sha256Hex(_ data: Data) -> String {
+    SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+}
+
+section("Install scripts (fake downloads)")
+do {
+    let fm = FileManager.default
+    let root = fm.temporaryDirectory.appendingPathComponent("installers_\(UUID().uuidString)")
+    defer { try? fm.removeItem(at: root) }
+    func write(_ url: URL, _ text: String, executable: Bool = false) {
+        try? fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        fm.createFile(atPath: url.path, contents: Data(text.utf8),
+                      attributes: [.posixPermissions: executable ? 0o755 : 0o644])
+    }
+    func contents(_ url: URL) -> String? {
+        (try? Data(contentsOf: url)).map { String(decoding: $0, as: UTF8.self) }
+    }
+    let bin = root.appendingPathComponent("bin")
+    write(bin.appendingPathComponent("curl"), fakeCurl, executable: true)
+    write(bin.appendingPathComponent("llama-server"),
+          "#!/bin/bash\n[ \"$1\" = --version ] && echo 'version: 0 (fake)' || echo '--mmproj FILE'\n",
+          executable: true)
+    let fakeServer = "#!/bin/bash\necho 'parakeet-server (fake)'\n"
+    let release = "parakeet-v0.0.0-test-bin-macos-metal-arm64"
+    write(root.appendingPathComponent("stage/\(release)/parakeet-server"), fakeServer, executable: true)
+    let tarball = root.appendingPathComponent("release.tar.gz")
+    let tar = Process()
+    tar.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
+    tar.arguments = ["-czf", tarball.path, "-C", root.appendingPathComponent("stage").path, release]
+    try? tar.run()
+    tar.waitUntilExit()
+    let tarballSHA = sha256Hex((try? Data(contentsOf: tarball)) ?? Data())
+
+    let body = "fake model bytes 0123456789abcdef"
+    var homes = 0
+    /// A fresh HOME; `installed` pre-installs the Parakeet binary.
+    func home(installed: Bool) -> (home: URL, models: URL) {
+        homes += 1
+        let home = root.appendingPathComponent("home\(homes)")
+        let murmur = home.appendingPathComponent("Library/Application Support/Murmur")
+        try? fm.createDirectory(at: murmur.appendingPathComponent("models"), withIntermediateDirectories: true)
+        if installed { write(murmur.appendingPathComponent("bin/parakeet-server"), fakeServer, executable: true) }
+        return (home, murmur.appendingPathComponent("models"))
+    }
+    let parakeetEnv = ["PARAKEET_VERSION": "v0.0.0-test", "PARAKEET_TARBALL_SHA256": tarballSHA,
+                       "FAKE_TARBALL": tarball.path, "PARAKEET_MODEL_SHA256": sha256Hex(Data(body.utf8)),
+                       "FAKE_CURL_BODY": body]
+    let parakeetFile = "parakeet-tdt-0.6b-v2-q8_0.gguf"
+    let qwenFile = "Qwen3-ASR-0.6B-Q8_0.gguf"
+
+    // Parakeet: an interrupted download resumes, is verified, then installed.
+    var (h, models) = home(installed: true)
+    write(models.appendingPathComponent("\(parakeetFile).partial"), String(body.prefix(10)))
+    var run = runInstaller("install_parakeet.sh", home: h, bin: bin, env: parakeetEnv)
+    expectEqual(run.status, 0, "parakeet: resumed download installs (\(run.output))")
+    expectEqual(contents(models.appendingPathComponent(parakeetFile)), body, "parakeet: resumed file is complete")
+    expect(!fm.fileExists(atPath: models.appendingPathComponent("\(parakeetFile).partial").path),
+           "parakeet: no .partial left after install")
+
+    // Parakeet: a download that fails the checksum is deleted before it is
+    // ever renamed to the installed name.
+    (h, models) = home(installed: true)
+    run = runInstaller("install_parakeet.sh", home: h, bin: bin,
+                       env: parakeetEnv.merging(["FAKE_CURL_BODY": "corrupt bytes"]) { $1 })
+    expectEqual(run.status, 1, "parakeet: checksum mismatch fails")
+    expect(run.output.contains("mismatch for \(parakeetFile).partial"),
+           "parakeet: the .partial is checked before the rename (\(run.output))")
+    expect(!fm.fileExists(atPath: models.appendingPathComponent(parakeetFile).path)
+           && !fm.fileExists(atPath: models.appendingPathComponent("\(parakeetFile).partial").path),
+           "parakeet: nothing is left after a mismatch")
+
+    // Parakeet: FORCE=1 starts over, so a full-length stale .partial (which
+    // makes curl -C - fail with HTTP 416) cannot block a reinstall.
+    (h, models) = home(installed: true)
+    write(models.appendingPathComponent("\(parakeetFile).partial"), String(repeating: "X", count: 100))
+    run = runInstaller("install_parakeet.sh", home: h, bin: bin,
+                       env: parakeetEnv.merging(["FORCE": "1"]) { $1 })
+    expectEqual(run.status, 0, "parakeet: FORCE=1 reinstalls past a stale .partial (\(run.output))")
+    expectEqual(contents(models.appendingPathComponent(parakeetFile)), body, "parakeet: FORCE=1 downloads afresh")
+
+    // Parakeet: a network failure keeps the .partial and says how to go on.
+    (h, models) = home(installed: true)
+    run = runInstaller("install_parakeet.sh", home: h, bin: bin,
+                       env: parakeetEnv.merging(["FAKE_CURL_FAIL": "18"]) { $1 })
+    expectEqual(run.status, 1, "parakeet: a failed download exits 1")
+    expect(run.output.contains("Rerun to resume, or rerun with FORCE=1 to start over"),
+           "parakeet: with no installed model the advice offers a resume (\(run.output))")
+    expectEqual(contents(models.appendingPathComponent("\(parakeetFile).partial")), String(body.prefix(4)),
+                "parakeet: the .partial is kept for a resume")
+
+    // Parakeet: a failed FORCE=1 re-download keeps the installed model and
+    // gives advice that works (a plain rerun cannot resume it); the next
+    // plain run removes the leftover .partial.
+    (h, models) = home(installed: true)
+    write(models.appendingPathComponent(parakeetFile), body)
+    run = runInstaller("install_parakeet.sh", home: h, bin: bin,
+                       env: parakeetEnv.merging(["FORCE": "1", "FAKE_CURL_FAIL": "18"]) { $1 })
+    expectEqual(run.status, 1, "parakeet: a failed FORCE=1 download exits 1")
+    expect(run.output.contains("Rerun with FORCE=1 to start over") && !run.output.contains("resume"),
+           "parakeet: the advice after a failed re-download is FORCE=1 only (\(run.output))")
+    expectEqual(contents(models.appendingPathComponent(parakeetFile)), body,
+                "parakeet: a failed re-download keeps the installed model")
+    run = runInstaller("install_parakeet.sh", home: h, bin: bin, env: parakeetEnv)
+    expectEqual(run.status, 0, "parakeet: the plain rerun finds the installed model")
+    expect(!fm.fileExists(atPath: models.appendingPathComponent("\(parakeetFile).partial").path),
+           "parakeet: the plain rerun removes the leftover .partial")
+
+    // Parakeet: an installed model that fails the checksum is deleted.
+    (h, models) = home(installed: true)
+    write(models.appendingPathComponent(parakeetFile), "corrupt")
+    run = runInstaller("install_parakeet.sh", home: h, bin: bin, env: parakeetEnv)
+    expectEqual(run.status, 1, "parakeet: a corrupt installed model fails")
+    expect(!fm.fileExists(atPath: models.appendingPathComponent(parakeetFile).path),
+           "parakeet: the corrupt installed model is deleted")
+
+    // Qwen3-ASR: FORCE=1 clears a stale .partial, and a download that fails
+    // the pinned checksum is deleted before the rename.
+    (h, models) = home(installed: false)
+    write(models.appendingPathComponent("\(qwenFile).partial"), String(repeating: "X", count: 100))
+    run = runInstaller("install_qwen_asr.sh", home: h, bin: bin, env: ["FORCE": "1", "FAKE_CURL_BODY": body])
+    expectEqual(run.status, 1, "qwen: pin mismatch fails")
+    expect(run.output.contains("mismatch for \(qwenFile).partial"),
+           "qwen: FORCE=1 downloaded afresh and checked the .partial (\(run.output))")
+    expect(!fm.fileExists(atPath: models.appendingPathComponent(qwenFile).path)
+           && !fm.fileExists(atPath: models.appendingPathComponent("\(qwenFile).partial").path),
+           "qwen: nothing is left after a mismatch")
+
+    // Qwen3-ASR: a network failure keeps the .partial and says how to go on.
+    (h, models) = home(installed: false)
+    run = runInstaller("install_qwen_asr.sh", home: h, bin: bin,
+                       env: ["FAKE_CURL_BODY": body, "FAKE_CURL_FAIL": "18"])
+    expectEqual(run.status, 1, "qwen: a failed download exits 1")
+    expect(run.output.contains("Rerun to resume, or rerun with FORCE=1 to start over"),
+           "qwen: with no installed model the advice offers a resume (\(run.output))")
+    expectEqual(contents(models.appendingPathComponent("\(qwenFile).partial")), String(body.prefix(4)),
+                "qwen: the .partial is kept for a resume")
+
+    // Qwen3-ASR: the same advice after a failed FORCE=1 re-download, and the
+    // next plain run removes the leftover .partial.
+    (h, models) = home(installed: false)
+    write(models.appendingPathComponent(qwenFile), "installed")
+    run = runInstaller("install_qwen_asr.sh", home: h, bin: bin,
+                       env: ["FORCE": "1", "FAKE_CURL_BODY": body, "FAKE_CURL_FAIL": "18"])
+    expect(run.status == 1 && run.output.contains("Rerun with FORCE=1 to start over")
+           && !run.output.contains("resume"),
+           "qwen: the advice after a failed re-download is FORCE=1 only (\(run.output))")
+    expectEqual(contents(models.appendingPathComponent(qwenFile)), "installed",
+                "qwen: a failed re-download keeps the installed model")
+    _ = runInstaller("install_qwen_asr.sh", home: h, bin: bin, env: ["FAKE_CURL_BODY": body])
+    expect(!fm.fileExists(atPath: models.appendingPathComponent("\(qwenFile).partial").path),
+           "qwen: the next plain run removes the leftover .partial")
+
+    // Qwen3-ASR: an installed model that fails the checksum is deleted.
+    (h, models) = home(installed: false)
+    write(models.appendingPathComponent(qwenFile), "corrupt")
+    run = runInstaller("install_qwen_asr.sh", home: h, bin: bin, env: ["FAKE_CURL_BODY": body])
+    expectEqual(run.status, 1, "qwen: a corrupt installed model fails")
+    expect(!fm.fileExists(atPath: models.appendingPathComponent(qwenFile).path),
+           "qwen: the corrupt installed model is deleted")
+}
+
 // MARK: - Integration: local whisper.cpp (no API key needed)
 
 let testConfig = Config.load()
 let whisperModel = (testConfig.whisperModelPath as NSString).expandingTildeInPath
+
+// Read-ahead on a model-sized file that no running server maps (whisper-server
+// reads its model into memory), so the test can drop it from the page cache.
+// Under memory pressure fcntl F_RDADVISE left 76-77% of this 1.6 GB file
+// resident (both rounds of this test) and lost more within seconds.
+if FileManager.default.fileExists(atPath: whisperModel) {
+    section("Integration: read-ahead on a model file")
+    for round in 1...2 {
+        evictFromPageCache(whisperModel)
+        let before = pageCacheFraction(whisperModel)
+        if before > 0.1 {
+            print("  SKIPPED: another process keeps \(Int(before * 100))% of the file resident")
+            break
+        }
+        let start = Date()
+        expect(Prewarm.readAhead(whisperModel), "round \(round): read-ahead of the model file succeeds")
+        let took = -start.timeIntervalSinceNow
+        let after = pageCacheFraction(whisperModel)
+        try? await Task.sleep(nanoseconds: 2_000_000_000) // a short hold before the server reads the weights
+        let held = pageCacheFraction(whisperModel)
+        print("  round \(round): \(String(format: "%.2f", took))s, \(Int(after * 100))% resident, "
+              + "\(Int(held * 100))% 2 s later")
+        expect(after > 0.99, "round \(round): the whole file is resident when read-ahead returns (got \(after))")
+        expect(held > 0.99, "round \(round): the file is still resident 2 s later (got \(held))")
+    }
+} else {
+    print("• Integration: read-ahead on a model file: SKIPPED (no whisper model)")
+}
+
 if FileManager.default.isExecutableFile(atPath: testConfig.whisperBinaryPath),
    FileManager.default.fileExists(atPath: whisperModel) {
     section("Integration: local whisper.cpp STT")
@@ -1544,6 +2597,130 @@ if FileManager.default.isExecutableFile(atPath: testConfig.whisperBinaryPath),
     }()
 } else {
     print("• Integration: local whisper.cpp — SKIPPED (whisper-server or model not installed)")
+}
+
+// MARK: - Integration: local Parakeet (gated on binary + model on disk)
+
+let parakeetBinary = (testConfig.parakeetBinaryPath as NSString).expandingTildeInPath
+let parakeetModel = (testConfig.parakeetModelPath as NSString).expandingTildeInPath
+if FileManager.default.isExecutableFile(atPath: parakeetBinary),
+   FileManager.default.fileExists(atPath: parakeetModel) {
+    section("Integration: local Parakeet STT")
+    await {
+        // Dedicated port so a running Murmur instance's server is untouched.
+        let engine = ParakeetEngine(binaryPath: testConfig.parakeetBinaryPath,
+                                    modelPath: testConfig.parakeetModelPath, port: 18_726)
+        defer { engine.shutdown() }
+        do {
+            let wav = try buildFixtureWAV()
+            let start = Date()
+            let transcript = try await engine.transcribe(wav: wav, prompt: "Glossary: ignored.")
+            print("  transcript (\(String(format: "%.2f", -start.timeIntervalSinceNow))s incl. model load): \(transcript)")
+            let normalized = transcript.lowercased()
+            expect(normalized.contains("quick brown fox"), "parakeet transcript contains 'quick brown fox'")
+            expect(normalized.contains("lazy dog"), "parakeet transcript contains 'lazy dog'")
+            expect(!normalized.contains("glossary"), "prompt is not echoed into the transcript")
+
+            let again = Date()
+            let second = try await engine.transcribe(wav: wav)
+            let warm = -again.timeIntervalSinceNow
+            print("  warm second pass: \(String(format: "%.2f", warm))s")
+            expectEqual(second, transcript, "warm pass is deterministic")
+            expect(warm < 2, "warm pass under 2 s (got \(String(format: "%.2f", warm))s)")
+
+            let warming = Date()
+            let warmed = await engine.prewarm(prompt: nil).value
+            print("  prewarm: \(String(format: "%.2f", -warming.timeIntervalSinceNow))s")
+            expect(warmed, "the live parakeet-server answers the prewarm request")
+            expectEqual(try await engine.transcribe(wav: wav), transcript, "a transcription after a prewarm is unchanged")
+
+            let silence = WAVEncoder.encode(samples: [Int16](repeating: 0, count: 16_000),
+                                            sampleRate: 16_000)
+            let quiet = try await engine.transcribe(wav: silence)
+            print("  silence: '\(quiet)'")
+            expect(quiet.split(separator: " ").count <= 2, "silence yields at most a stray token")
+
+            let long = try buildLongFixtureWAV(seconds: ParakeetEngine.maxChunkSeconds + 10)
+            let longStart = Date()
+            let longText = try await engine.transcribe(wav: long)
+            print("  \(Int(ParakeetEngine.maxChunkSeconds + 10)) s, chunked (\(String(format: "%.2f", -longStart.timeIntervalSinceNow))s): \(longText)")
+            expectEqual(longText.lowercased().components(separatedBy: "quick brown fox").count - 1, 2,
+                        "both utterances survive the chunk boundary")
+
+            // Another server object on the same binary and port adopts this
+            // child, and a shutdown during that start leaves it not ready.
+            let adopter = ChildServer(name: "adopter", binaryPath: parakeetBinary, port: 18_726,
+                                      session: LoopbackURLSession.make(resourceTimeout: 5)) { _ in [] }
+            let adopted = try await adopter.ensureRunning(polls: 4) {}
+            expect(adopted && adopter.port == 18_726, "an own-binary server on the port is adopted")
+            let overtaken = ChildServer(name: "overtaken", binaryPath: parakeetBinary, port: 18_726,
+                                        session: LoopbackURLSession.make(resourceTimeout: 5)) { _ in [] }
+            let overtakenResult = try await overtaken.ensureRunning(polls: 4) { overtaken.shutdown() }
+            expectEqual(overtakenResult, false, "an adopting start overtaken by a shutdown is not ready")
+            expectEqual(try await engine.transcribe(wav: wav), transcript,
+                        "the adopted child keeps serving its owner")
+        } catch {
+            failed += 1
+            print("  FAIL — local Parakeet integration threw: \(error)")
+        }
+    }()
+} else {
+    print("• Integration: local Parakeet — SKIPPED (run scripts/install_parakeet.sh)")
+}
+
+// MARK: - Integration: local Qwen3-ASR (gated on llama-server + model + projector)
+
+let qwenModel = (testConfig.qwenAsrModelPath as NSString).expandingTildeInPath
+let qwenMmproj = (testConfig.qwenAsrMmprojPath as NSString).expandingTildeInPath
+if FileManager.default.isExecutableFile(atPath: testConfig.llamaBinaryPath),
+   FileManager.default.fileExists(atPath: qwenModel),
+   FileManager.default.fileExists(atPath: qwenMmproj) {
+    section("Integration: local Qwen3-ASR STT")
+    await {
+        // Dedicated port so a running Murmur instance's server is untouched.
+        let engine = QwenAsrEngine(binaryPath: testConfig.llamaBinaryPath, modelPath: qwenModel,
+                                   mmprojPath: qwenMmproj, port: 18_727)
+        defer { engine.shutdown() }
+        do {
+            let wav = try buildFixtureWAV()
+            let prompt = VocabularyPrompt.whisperPrompt(Config().vocabulary(for: .code))
+            let start = Date()
+            let transcript = try await engine.transcribe(wav: wav, prompt: prompt)
+            print("  transcript (\(String(format: "%.2f", -start.timeIntervalSinceNow))s incl. model load): \(transcript)")
+            let normalized = transcript.lowercased()
+            expect(normalized.contains("quick brown fox"), "qwen transcript contains 'quick brown fox'")
+            expect(normalized.contains("lazy dog"), "qwen transcript contains 'lazy dog'")
+            expect(!normalized.contains("<asr_text>") && !normalized.hasPrefix("language"),
+                   "language tag stripped from the transcript")
+            expect(!normalized.contains("pytorch"), "vocabulary context is not echoed into the transcript")
+
+            let again = Date()
+            _ = try await engine.transcribe(wav: wav, prompt: prompt)
+            let warm = -again.timeIntervalSinceNow
+            print("  warm second pass: \(String(format: "%.2f", warm))s")
+            expect(warm < 2, "warm pass under 2 s (got \(String(format: "%.2f", warm))s)")
+
+            let warming = Date()
+            let warmed = await engine.prewarm(prompt: prompt).value
+            print("  prewarm: \(String(format: "%.2f", -warming.timeIntervalSinceNow))s")
+            expect(warmed, "the live Qwen3-ASR server answers the prewarm request")
+            let afterWarm = try await engine.transcribe(wav: wav, prompt: prompt).lowercased()
+            expect(afterWarm.contains("quick brown fox") && afterWarm.contains("lazy dog"),
+                   "a transcription after a prewarm is unchanged")
+
+            let long = try buildLongFixtureWAV(seconds: QwenAsrEngine.maxChunkSeconds + 10)
+            let longStart = Date()
+            let longText = try await engine.transcribe(wav: long, prompt: prompt)
+            print("  \(Int(QwenAsrEngine.maxChunkSeconds + 10)) s, chunked (\(String(format: "%.2f", -longStart.timeIntervalSinceNow))s): \(longText)")
+            expectEqual(longText.lowercased().components(separatedBy: "quick brown fox").count - 1, 2,
+                        "both utterances survive the chunk boundary")
+        } catch {
+            failed += 1
+            print("  FAIL — local Qwen3-ASR integration threw: \(error)")
+        }
+    }()
+} else {
+    print("• Integration: local Qwen3-ASR — SKIPPED (run scripts/install_qwen_asr.sh)")
 }
 
 // MARK: - Integration: local Kyutai streaming (no API key needed)
@@ -1656,6 +2833,13 @@ if FileManager.default.isExecutableFile(atPath: testConfig.llamaBinaryPath),
             let vocab = await cleaner.cleanOrFallback("please install pie torch and scikit learn today")
             print("  vocab repair (observation): \(vocab)")
             print("  warm call: \(String(format: "%.2f", -warm.timeIntervalSinceNow))s")
+
+            let warming = Date()
+            let warmed = await cleaner.prewarm()?.value
+            print("  prewarm: \(String(format: "%.2f", -warming.timeIntervalSinceNow))s")
+            expectEqual(warmed, true, "the live llama-server answers the cleanup prewarm request")
+            let afterWarm = await cleaner.cleanOrFallback("what is the capital of France")
+            expect(!afterWarm.lowercased().contains("paris"), "cleanup after a prewarm still never answers")
         } catch {
             failed += 1
             print("  FAIL — local llama.cpp integration threw: \(error)")

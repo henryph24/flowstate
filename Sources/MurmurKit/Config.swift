@@ -30,6 +30,8 @@ public enum EngineKind: String, Codable, CaseIterable {
     case groq
     case whisperCpp
     case kyutai
+    case parakeet
+    case qwenAsr
 
     /// Shown in the engine picker (menu bar submenu + status window).
     public var displayName: String {
@@ -37,13 +39,15 @@ public enum EngineKind: String, Codable, CaseIterable {
         case .groq: return "Groq (cloud)"
         case .whisperCpp: return "Local Whisper (whisper.cpp)"
         case .kyutai: return "Local Kyutai (streaming)"
+        case .parakeet: return "Local Parakeet (parakeet.cpp)"
+        case .qwenAsr: return "Local Qwen3-ASR (llama.cpp)"
         }
     }
 
     public var isLocal: Bool {
         switch self {
         case .groq: return false
-        case .whisperCpp, .kyutai: return true
+        case .whisperCpp, .kyutai, .parakeet, .qwenAsr: return true
         }
     }
 }
@@ -104,6 +108,16 @@ public struct Config {
     public var kyutaiConfigPath: String?   // nil → app-managed default in Application Support
     public var kyutaiPort = 8090
     public var kyutaiApiKey = "public_token"
+    /// parakeet.cpp server and NVIDIA Parakeet TDT model, both installed by
+    /// scripts/install_parakeet.sh (no Homebrew formula exists).
+    public var parakeetBinaryPath = "~/Library/Application Support/Murmur/bin/parakeet-server"
+    public var parakeetModelPath = "~/Library/Application Support/Murmur/models/parakeet-tdt-0.6b-v2-q8_0.gguf"
+    public var parakeetPort = 8726
+    /// Qwen3-ASR GGUF + audio projector, run by a second llama-server
+    /// (`llamaBinaryPath`); scripts/install_qwen_asr.sh downloads both.
+    public var qwenAsrModelPath = "~/Library/Application Support/Murmur/models/Qwen3-ASR-0.6B-Q8_0.gguf"
+    public var qwenAsrMmprojPath = "~/Library/Application Support/Murmur/models/mmproj-Qwen3-ASR-0.6B-Q8_0.gguf"
+    public var qwenAsrPort = 8727
     public var hotkey: Hotkey = .fn
     public var minHoldSeconds: TimeInterval = 0.25
     public var maxRecordSeconds: TimeInterval = 600
@@ -179,6 +193,12 @@ public struct Config {
         var kyutaiConfigPath: String?
         var kyutaiPort: Int?
         var kyutaiApiKey: String?
+        var parakeetBinaryPath: String?
+        var parakeetModelPath: String?
+        var parakeetPort: Int?
+        var qwenAsrModelPath: String?
+        var qwenAsrMmprojPath: String?
+        var qwenAsrPort: Int?
         var hotkey: Hotkey?
         var minHoldSeconds: TimeInterval?
         var maxRecordSeconds: TimeInterval?
@@ -247,6 +267,12 @@ public struct Config {
         kyutaiConfigPath = file.kyutaiConfigPath ?? kyutaiConfigPath
         kyutaiPort = file.kyutaiPort ?? kyutaiPort
         kyutaiApiKey = file.kyutaiApiKey ?? kyutaiApiKey
+        parakeetBinaryPath = file.parakeetBinaryPath ?? parakeetBinaryPath
+        parakeetModelPath = file.parakeetModelPath ?? parakeetModelPath
+        parakeetPort = file.parakeetPort ?? parakeetPort
+        qwenAsrModelPath = file.qwenAsrModelPath ?? qwenAsrModelPath
+        qwenAsrMmprojPath = file.qwenAsrMmprojPath ?? qwenAsrMmprojPath
+        qwenAsrPort = file.qwenAsrPort ?? qwenAsrPort
         hotkey = file.hotkey ?? hotkey
         minHoldSeconds = file.minHoldSeconds ?? minHoldSeconds
         maxRecordSeconds = file.maxRecordSeconds ?? maxRecordSeconds
@@ -278,6 +304,12 @@ public struct Config {
             kyutaiConfigPath: kyutaiConfigPath,
             kyutaiPort: kyutaiPort,
             kyutaiApiKey: kyutaiApiKey,
+            parakeetBinaryPath: parakeetBinaryPath,
+            parakeetModelPath: parakeetModelPath,
+            parakeetPort: parakeetPort,
+            qwenAsrModelPath: qwenAsrModelPath,
+            qwenAsrMmprojPath: qwenAsrMmprojPath,
+            qwenAsrPort: qwenAsrPort,
             hotkey: hotkey,
             minHoldSeconds: minHoldSeconds,
             maxRecordSeconds: maxRecordSeconds

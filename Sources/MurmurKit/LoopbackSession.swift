@@ -104,6 +104,15 @@ public enum LocalServer {
         return String(cString: buffer)
     }
 
+    /// The parent of a running process (via `proc_pidinfo`), nil if unknown.
+    public static func parentPID(of pid: pid_t) -> pid_t? {
+        guard pid > 0 else { return nil }
+        var info = proc_bsdinfo()
+        let size = Int32(MemoryLayout<proc_bsdinfo>.size)
+        guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size) == size else { return nil }
+        return pid_t(info.pbi_ppid)
+    }
+
     /// Child servers inherit the app's environment MINUS anything credential-
     /// shaped (a large third-party binary should never receive GROQ_API_KEY etc.).
     /// HOME/PATH/DYLD/HF_* are preserved so the servers still find their runtime

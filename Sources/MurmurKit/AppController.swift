@@ -91,6 +91,8 @@ public final class AppController {
         case .groq: sttDesc = "groq/\(config.sttModel)"
         case .whisperCpp: sttDesc = "local whisper.cpp"
         case .kyutai: sttDesc = "local kyutai (streaming)"
+        case .parakeet: sttDesc = "local parakeet.cpp"
+        case .qwenAsr: sttDesc = "local qwen3-asr (llama.cpp)"
         }
         let cleanupDesc: String
         if config.cleanupEnabled, cleaner != nil {
@@ -235,6 +237,11 @@ public final class AppController {
             try recorder.start()
             hud.show(.listening)
             startMaxDurationTimer()
+            // Page the local models back in while the user speaks (see
+            // `Prewarmable`). The release recomputes the prompt: a term
+            // auto-learned by the flush below joins this dictation.
+            Prewarm.forDictation(engine: engine, cleaner: config.cleanupEnabled ? cleaner : nil,
+                                 prompt: VocabularyPrompt.whisperPrompt(config.vocabulary(for: dictationContext)))
             // Second chance for the previous utterance's read-back: the field
             // is about to change. Deferred a runloop turn so the AX round trip
             // can never delay the recorder or the HUD (audio is already being
@@ -487,6 +494,40 @@ public final class AppController {
                                                    port: config.kyutaiPort, apiKey: config.kyutaiApiKey)
                 kyutai.warmUp()
                 engine = kyutai
+                engineHint = nil
+            }
+        case .parakeet:
+            let binary = (config.parakeetBinaryPath as NSString).expandingTildeInPath
+            let model = (config.parakeetModelPath as NSString).expandingTildeInPath
+            if !FileManager.default.isExecutableFile(atPath: binary) {
+                engine = nil
+                engineHint = "parakeet-server missing: run scripts/install_parakeet.sh"
+            } else if !FileManager.default.fileExists(atPath: model) {
+                engine = nil
+                engineHint = "Parakeet model missing: run scripts/install_parakeet.sh"
+            } else {
+                let parakeet = ParakeetEngine(binaryPath: binary, modelPath: model,
+                                              port: config.parakeetPort)
+                parakeet.warmUp()
+                engine = parakeet
+                engineHint = nil
+            }
+        case .qwenAsr:
+            let model = (config.qwenAsrModelPath as NSString).expandingTildeInPath
+            let mmproj = (config.qwenAsrMmprojPath as NSString).expandingTildeInPath
+            if !FileManager.default.isExecutableFile(atPath: config.llamaBinaryPath) {
+                engine = nil
+                engineHint = "llama-server missing: run scripts/install_qwen_asr.sh"
+            } else if !FileManager.default.fileExists(atPath: model)
+                        || !FileManager.default.fileExists(atPath: mmproj) {
+                engine = nil
+                engineHint = "Qwen3-ASR model missing: run scripts/install_qwen_asr.sh"
+            } else {
+                let qwen = QwenAsrEngine(binaryPath: config.llamaBinaryPath, modelPath: model,
+                                         mmprojPath: mmproj, port: config.qwenAsrPort,
+                                         language: config.language)
+                qwen.warmUp()
+                engine = qwen
                 engineHint = nil
             }
         }

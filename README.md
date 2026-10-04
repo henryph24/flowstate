@@ -31,10 +31,10 @@ Dictation tools either send your voice to the cloud, or run locally and hand
 you raw, filler-riddled transcripts that mangle every technical term. Flowstate
 refuses both trade-offs:
 
-- **Nothing leaves your Mac.** Speech-to-text (whisper.cpp or Kyutai) and the
-  cleanup LLM (llama.cpp, 3B) run as warm local child processes on loopback.
-  No account, no API key, no subscription, works in airplane mode. Cloud
-  (Groq) exists only as an explicit opt-in.
+- **Nothing leaves your Mac.** Speech-to-text (whisper.cpp, Parakeet,
+  Qwen3-ASR or Kyutai) and the cleanup LLM (llama.cpp, 3B) run as warm local
+  child processes on loopback. No account, no API key, no subscription, works
+  in airplane mode. Cloud (Groq) exists only as an explicit opt-in.
 
 - **It knows technical vocabulary out of the box.** ~610 built-in terms across
   software engineering, AI/ML, data science, econometrics, and quant finance
@@ -43,7 +43,8 @@ refuses both trade-offs:
   context (code terms in editors, econ/AI terms everywhere).
 
 - **Three repair layers, engineered to never make things worse.**
-  1. *Decoder biasing*: your vocabulary is fed into Whisper's prompt.
+  1. *Decoder biasing*: your vocabulary is fed into Whisper's prompt
+     (Qwen3-ASR reads it as context; Parakeet takes no prompt).
   2. *Deterministic corrector*: a pure, exact-match pass fixes casing,
      hyphenation, and ~30 curated mishearings ("pie torch" → `PyTorch`,
      "cube control" → `kubectl`, "cloud code" → `Claude Code`) instantly,
@@ -64,8 +65,8 @@ refuses both trade-offs:
 
 - **Boring, auditable engineering.** Pure Swift/SwiftPM, zero external Swift
   dependencies, builds with Command Line Tools only (no Xcode). One binary,
-  two optional local servers, 803 tests including live integration against
-  the real STT and LLM servers.
+  local child servers for speech and cleanup, 1111 tests including live
+  integration against the real STT and LLM servers.
 
 ## Setup
 
@@ -135,8 +136,44 @@ lost grant: `tccutil reset Accessibility dev.hungpq.murmur`, re-grant.
 | What | How |
 |---|---|
 | Streaming STT (live words in the HUD) | `./scripts/install_kyutai.sh`, then menu → engine → Kyutai |
+| Fastest local STT (Parakeet TDT 0.6B) | `./scripts/install_parakeet.sh`, then menu → engine → Local Parakeet |
+| Faster STT that reads your vocabulary (Qwen3-ASR) | `./scripts/install_qwen_asr.sh`, then menu → engine → Local Qwen3-ASR |
 | Cloud STT/cleanup (Groq) | menu → *Set API Key…*; `"cleanupEngine": "groq"` for cloud cleanup |
 | Reuse a GGUF you already have | point `llamaModelPath` at any instruct GGUF (e.g. LM Studio's cache) |
+
+### Choosing a speech engine
+
+Measured on an M3 Pro with warm servers: word error rate and median latency on
+73 LibriSpeech recordings (real speech), and technical terms spelled right in
+the final text (after the corrector and cleanup) on 80 synthetic clips holding
+16 terms such as `kubectl` and `scikit-learn`.
+
+| Engine (model) | Error rate | Latency | Terms right | Disk |
+|---|---|---|---|---|
+| whisper.cpp (large-v3-turbo), default | 5.4% | 0.72 s | 65/80 | 1.6 GB |
+| Parakeet (TDT 0.6B v2) | 2.9% | 0.09 s | 51/80 | 0.9 GB |
+| Parakeet (TDT 1.1B, `PARAKEET_MODEL=tdt-1.1b-q8_0.gguf`) | 1.9% | 0.10 s | 52/80 | 1.6 GB |
+| Parakeet (TDT 0.6B v3, 25 languages, `PARAKEET_MODEL=tdt-0.6b-v3-q8_0.gguf`) | 3.8% | 0.08 s | 57/80 | 0.9 GB |
+| Qwen3-ASR (0.6B) | 4.3% | 0.27 s | 66/80 | 1.0 GB |
+| Qwen3-ASR (1.7B, `QWEN_ASR_SIZE=1.7B`) | 4.1% | 0.69 s | 71/80 | 2.5 GB |
+
+The variables in the first column pick that model at install time; then set
+the config paths the script prints.
+Parakeet has no prompt, so your vocabulary reaches it only through the
+corrector and the cleanup pass. Whisper was the most robust on an unusual
+synthetic voice (5% errors, Qwen3-ASR 8-13%, Parakeet 36-49%). Parakeet and
+Qwen3-ASR transcribe recordings longer than 60 s in 60 s pieces cut at
+pauses: a 10-minute recording takes 7.9 s on Parakeet, 18 s on Qwen3-ASR
+0.6B and 29 s on Whisper.
+
+These latencies hold while the servers are warm. On a Mac short of memory,
+macOS takes an idle server's memory back, and the next dictation waits while
+the model comes back into memory. Pressing the hotkey starts that reload for
+Qwen3-ASR, Parakeet and the cleanup model while you speak: after 10 GB of
+other file reads, a 5 s dictation on Qwen3-ASR 1.7B with cleanup took 0.9 to
+1.1 s when the hotkey was held 3 s, and 5.4 to 7.8 s with no head start.
+Whisper is left out: its server encodes a full 30 s window for any request, so
+a warm-up delayed short dictations by 0.4 s.
 
 > **Groq is the one path that leaves your Mac.** Enabling it uploads your
 > recorded audio and the transcript (including any auto-learned vocabulary
@@ -184,7 +221,7 @@ Restart Flowstate after editing.
 ```jsonc
 {
   "hotkey": "fn",                   // fn | rightCommand
-  "engine": "whisperCpp",           // whisperCpp | kyutai | groq
+  "engine": "whisperCpp",           // whisperCpp | parakeet | qwenAsr | kyutai | groq
   "cleanupEnabled": true,           // the LLM pass (corrector always runs)
   "cleanupEngine": "local",         // local | groq
   "language": "en",
@@ -205,6 +242,12 @@ Restart Flowstate after editing.
   "llamaPort": 8725,
   "kyutaiBinaryPath": "~/.cargo/bin/moshi-server",
   "kyutaiPort": 8090,
+  "parakeetBinaryPath": "~/Library/Application Support/Murmur/bin/parakeet-server",
+  "parakeetModelPath": "~/Library/Application Support/Murmur/models/parakeet-tdt-0.6b-v2-q8_0.gguf",
+  "parakeetPort": 8726,
+  "qwenAsrModelPath": "~/Library/Application Support/Murmur/models/Qwen3-ASR-0.6B-Q8_0.gguf",
+  "qwenAsrMmprojPath": "~/Library/Application Support/Murmur/models/mmproj-Qwen3-ASR-0.6B-Q8_0.gguf",
+  "qwenAsrPort": 8727,              // runs on llamaBinaryPath
   "minHoldSeconds": 0.25,
   "maxRecordSeconds": 600,
   "pasteboardRestoreDelay": 0.6
@@ -216,7 +259,7 @@ Restart Flowstate after editing.
 ```sh
 swift build                  # SwiftPM only, no Xcode required
 swift run Murmur             # dev run, inherits the terminal's permissions
-swift run MurmurTests        # 803 unit + local-integration assertions
+swift run MurmurTests        # 1111 unit + local-integration assertions
 ```
 
 Dev-loop env overrides: `MURMUR_HOTKEY`, `MURMUR_ENGINE`,

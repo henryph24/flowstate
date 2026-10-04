@@ -34,7 +34,7 @@ public enum LlamaCppError: Error, LocalizedError {
 /// is optional, so `chatComplete` waits at most ~2s for warmth and otherwise
 /// throws (`Cleaner` falls back to the raw transcript) — only `warmUp()` /
 /// `ensureReady()` sit through a cold model load.
-public final class LlamaCppChatEngine: ChatEngine, LocalServerEngine {
+public final class LlamaCppChatEngine: ChatEngine, LocalServerEngine, Prewarmable {
     static let warmUpPolls = 240 // × 250ms = 60s — cold GGUF load
     static let requestPolls = 8  // × 250ms = 2s — never make a paste wait
 
@@ -78,6 +78,24 @@ public final class LlamaCppChatEngine: ChatEngine, LocalServerEngine {
     /// utterance path.
     public func ensureReady() async throws {
         try await ensureServerRunning(pollBudget: Self.warmUpPolls)
+    }
+
+    /// `prompt` is the cleanup system prompt (see `Cleaner.prewarm`). Reads
+    /// the model file ahead (llama-server maps it) while the one-token
+    /// request pages in the rest.
+    @discardableResult
+    public func prewarm(prompt: String?) -> Task<Bool, Never> {
+        Task.detached { [weak self] in
+            guard let self else { return false }
+            async let weights: Void = Prewarm.readAheadInBackground(self.modelPath)
+            var answered = false
+            if (try? await self.ensureServerRunning(pollBudget: Self.requestPolls)) != nil {
+                answered = await Prewarm.send(try? Self.makePrewarmRequest(system: prompt ?? "", port: self.activePort),
+                                              with: self.session)
+            }
+            await weights
+            return answered
+        }
     }
 
     public func shutdown() {
@@ -155,6 +173,11 @@ public final class LlamaCppChatEngine: ChatEngine, LocalServerEngine {
         var request = URLRequest(url: URL(string: "http://127.0.0.1:\(port)/health")!)
         request.timeoutInterval = 1
         return request
+    }
+
+    /// The system prompt with a placeholder transcript, one output token.
+    public static func makePrewarmRequest(system: String, port: Int) throws -> URLRequest {
+        try makeChatRequest(system: system, user: "<transcript>\nok\n</transcript>", maxTokens: 1, port: port)
     }
 
     public static func makeChatRequest(system: String, user: String,

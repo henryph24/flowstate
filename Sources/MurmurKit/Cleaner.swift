@@ -55,6 +55,13 @@ public struct Cleaner {
         Cleaner(chat: chat, minWords: minWords, vocabulary: terms)
     }
 
+    /// Warms a local cleanup model with this system prompt (see `Prewarmable`);
+    /// nil for a chat engine without a local server (Groq).
+    @discardableResult
+    public func prewarm() -> Task<Bool, Never>? {
+        (chat as? Prewarmable)?.prewarm(prompt: systemPrompt)
+    }
+
     public func cleanOrFallback(_ raw: String) async -> String {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         let wordCount = trimmed.split(whereSeparator: \.isWhitespace).count
