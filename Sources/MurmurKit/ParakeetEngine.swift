@@ -49,10 +49,10 @@ public final class ParakeetEngine: TranscriptionEngine, LocalServerEngine, Prewa
 
     /// `prompt` is ignored: Parakeet has no decoder prompt.
     public func transcribe(wav: Data, prompt: String?) async throws -> String {
-        try await ensureServerRunning()
+        _ = try await ensureServerRunning()
         return try await AudioChunker.transcribe(wav: wav, maxSeconds: Self.maxChunkSeconds) { piece in
-            try await ensureServerRunning() // a retry after a crash respawns the server
-            let request = Self.makeTranscriptionRequest(wav: piece, port: server.port)
+            let port = try await ensureServerRunning() // a retry after a crash respawns the server
+            let request = Self.makeTranscriptionRequest(wav: piece, port: port)
             let (data, response) = try await session.data(for: request)
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0
             guard status == 200 else { throw ParakeetError.http(status: status) }
@@ -63,15 +63,15 @@ public final class ParakeetEngine: TranscriptionEngine, LocalServerEngine, Prewa
     /// Spawns the server eagerly so the model is warm before the first
     /// utterance. Safe to call repeatedly.
     public func warmUp() {
-        Task.detached { [weak self] in try? await self?.ensureServerRunning() }
+        Task.detached { [weak self] in _ = try? await self?.ensureServerRunning() }
     }
 
     /// `prompt` is ignored, as in `transcribe`.
     @discardableResult
     public func prewarm(prompt: String?) -> Task<Bool, Never> {
         Task.detached { [weak self] in
-            guard let self, (try? await self.ensureServerRunning()) != nil else { return false }
-            return await Prewarm.send(Self.makePrewarmRequest(port: self.server.port), with: self.session)
+            guard let self, let port = try? await self.ensureServerRunning() else { return false }
+            return await Prewarm.send(Self.makePrewarmRequest(port: port), with: self.session)
         }
     }
 
@@ -79,8 +79,9 @@ public final class ParakeetEngine: TranscriptionEngine, LocalServerEngine, Prewa
         server.shutdown()
     }
 
-    private func ensureServerRunning() async throws {
-        let ready = try await server.ensureRunning(polls: 120) {
+    /// The port of the verified server.
+    private func ensureServerRunning() async throws -> Int {
+        let port = try await server.ensureRunning(polls: 120) {
             guard LocalServer.isSafeToExecute(binaryPath) else {
                 throw ParakeetError.binaryMissing(binaryPath)
             }
@@ -88,7 +89,8 @@ public final class ParakeetEngine: TranscriptionEngine, LocalServerEngine, Prewa
                 throw ParakeetError.modelMissing(modelPath)
             }
         }
-        guard ready else { throw ParakeetError.serverTimeout }
+        guard let port else { throw ParakeetError.serverTimeout }
+        return port
     }
 
     // MARK: pure request/argument builders (unit-tested)

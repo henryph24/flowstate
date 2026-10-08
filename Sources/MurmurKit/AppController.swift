@@ -68,6 +68,9 @@ public final class AppController {
         recorder.onConfigurationChange = { [weak self] in
             DispatchQueue.main.async { self?.dispatch(.abort) }
         }
+        recorder.onLevel = { [weak self] level in
+            DispatchQueue.main.async { self?.hud.pushLevel(level) }
+        }
 
         statusItem.onSetAPIKey = { [weak self] in self?.promptForAPIKey() }
         statusItem.onSelectEngine = { [weak self] kind in self?.selectEngine(kind) }

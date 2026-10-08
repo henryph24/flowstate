@@ -45,18 +45,19 @@ public final class ChildServer {
 
     deinit { shutdown() }
 
-    /// The port of the server last started or adopted.
+    /// The port of the server last started or adopted. A request uses the
+    /// port `ensureRunning` returns, because a later start can move this one.
     public var port: Int { locked { currentPort } }
 
-    /// True once the server answers `/health`, polling up to `polls` times
-    /// (250 ms apart; a probe gives up after 1 s without data). When no child
-    /// of ours is running, `preflight` runs first (binary and model checks),
-    /// then the server is adopted or spawned. False on timeout, as soon as a
-    /// spawned child exits (a bad model never becomes ready), when another
-    /// process answered on the child's port (the child is stopped), or once
-    /// `shutdown()` has run.
-    public func ensureRunning(polls: Int, preflight: () throws -> Void) async throws -> Bool {
-        if await isVerifiedAndHealthy() { return true }
+    /// The server's port once it answers `/health`, polling up to `polls`
+    /// times (250 ms apart; a probe gives up after 1 s without data). When no
+    /// child of ours is running, `preflight` runs first (binary and model
+    /// checks), then the server is adopted or spawned. Nil on timeout, as soon
+    /// as a spawned child exits (a bad model never becomes ready), when
+    /// another process answered on the child's port (the child is stopped),
+    /// or once `shutdown()` has run.
+    public func ensureRunning(polls: Int, preflight: () throws -> Void) async throws -> Int? {
+        if let port = await verifiedHealthyPort() { return port }
         await gate.enter()
         do {
             let ready = try await start(polls: polls, preflight: preflight)
@@ -93,10 +94,10 @@ public final class ChildServer {
 
     // MARK: internals
 
-    private func start(polls: Int, preflight: () throws -> Void) async throws -> Bool {
-        guard !locked({ retired }) else { return false }
+    private func start(polls: Int, preflight: () throws -> Void) async throws -> Int? {
+        guard !locked({ retired }) else { return nil }
         // A caller ahead of us at the gate may have finished the start.
-        if await isVerifiedAndHealthy() { return true }
+        if let port = await verifiedHealthyPort() { return port }
 
         let child: Process? // nil: an adopted orphan, attributed by resolvePort
         let target: Int
@@ -137,7 +138,7 @@ public final class ChildServer {
                 }
                 guard kept else { // retired during this start
                     server.terminate()
-                    return false
+                    return nil
                 }
                 Log.info("\(name) spawned (pid \(server.processIdentifier), port \(free))")
                 child = server
@@ -148,7 +149,7 @@ public final class ChildServer {
         for _ in 0..<polls {
             if await isHealthy(port: target) {
                 // An adopted orphan is ours unless the server retired meanwhile.
-                guard let child else { return !locked({ retired }) }
+                guard let child else { return locked({ retired }) ? nil : target }
                 let holdsPort = child.isRunning && owns(child.processIdentifier, target)
                 // Decided under the lock: a shutdown during the probe or the
                 // ownership check wins, and then this answer is not the child's.
@@ -157,19 +158,19 @@ public final class ChildServer {
                     if holdsPort { verified = true }
                     return true
                 }
-                guard current else { return false }
-                if holdsPort { return true }
+                guard current else { return nil }
+                if holdsPort { return target }
                 Log.info("\(name): another process answered on port \(target); refusing it")
                 abandon(child)
-                return false
+                return nil
             }
             if let child, !child.isRunning {
                 abandon(child)
-                return false
+                return nil
             }
             try await Task.sleep(nanoseconds: 250_000_000)
         }
-        return false
+        return nil
     }
 
     /// Drops a child that never became ready and keeps later starts off its
@@ -182,13 +183,14 @@ public final class ChildServer {
         if child.isRunning { child.terminate() }
     }
 
-    private func isVerifiedAndHealthy() async -> Bool {
+    private func verifiedHealthyPort() async -> Int? {
         guard let (child, port) = locked({ () -> (Process, Int)? in
             guard verified, let process, process.isRunning else { return nil }
             return (process, currentPort)
-        }) else { return false }
-        guard await isHealthy(port: port) else { return false }
-        return locked { verified && process === child } // a shutdown during the probe wins
+        }) else { return nil }
+        guard await isHealthy(port: port) else { return nil }
+        // A shutdown or a new child during the probe wins.
+        return locked { verified && process === child } ? port : nil
     }
 
     private func isHealthy(port: Int) async -> Bool {

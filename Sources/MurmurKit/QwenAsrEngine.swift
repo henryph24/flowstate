@@ -54,11 +54,11 @@ public final class QwenAsrEngine: TranscriptionEngine, LocalServerEngine, Prewar
     deinit { shutdown() }
 
     public func transcribe(wav: Data, prompt: String?) async throws -> String {
-        try await ensureServerRunning()
+        _ = try await ensureServerRunning()
         return try await AudioChunker.transcribe(wav: wav, maxSeconds: Self.maxChunkSeconds) { piece in
-            try await ensureServerRunning() // a retry after a crash respawns the server
+            let port = try await ensureServerRunning() // a retry after a crash respawns the server
             let request = try Self.makeTranscriptionRequest(wav: piece, prompt: prompt,
-                                                            language: language, port: server.port)
+                                                            language: language, port: port)
             let (data, response) = try await session.data(for: request)
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0
             guard status == 200 else { throw QwenAsrError.http(status: status) }
@@ -69,7 +69,7 @@ public final class QwenAsrEngine: TranscriptionEngine, LocalServerEngine, Prewar
     /// Spawns the server eagerly so the model is warm before the first
     /// utterance. Safe to call repeatedly.
     public func warmUp() {
-        Task.detached { [weak self] in try? await self?.ensureServerRunning() }
+        Task.detached { [weak self] in _ = try? await self?.ensureServerRunning() }
     }
 
     /// Reads the model file ahead (llama-server maps it; the projector is
@@ -80,9 +80,9 @@ public final class QwenAsrEngine: TranscriptionEngine, LocalServerEngine, Prewar
             guard let self else { return false }
             async let weights: Void = Prewarm.readAheadInBackground(self.modelPath)
             var answered = false
-            if (try? await self.ensureServerRunning()) != nil {
+            if let port = try? await self.ensureServerRunning() {
                 answered = await Prewarm.send(try? Self.makePrewarmRequest(prompt: prompt, language: self.language,
-                                                                           port: self.server.port),
+                                                                           port: port),
                                               with: self.session)
             }
             await weights
@@ -94,8 +94,9 @@ public final class QwenAsrEngine: TranscriptionEngine, LocalServerEngine, Prewar
         server.shutdown()
     }
 
-    private func ensureServerRunning() async throws {
-        let ready = try await server.ensureRunning(polls: 120) {
+    /// The port of the verified server.
+    private func ensureServerRunning() async throws -> Int {
+        let port = try await server.ensureRunning(polls: 120) {
             guard LocalServer.isSafeToExecute(binaryPath) else {
                 throw QwenAsrError.binaryMissing(binaryPath)
             }
@@ -103,7 +104,8 @@ public final class QwenAsrEngine: TranscriptionEngine, LocalServerEngine, Prewar
                 throw QwenAsrError.modelMissing(path)
             }
         }
-        guard ready else { throw QwenAsrError.serverTimeout }
+        guard let port else { throw QwenAsrError.serverTimeout }
+        return port
     }
 
     // MARK: pure request/argument builders (unit-tested)

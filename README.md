@@ -65,7 +65,7 @@ refuses both trade-offs:
 
 - **Boring, auditable engineering.** Pure Swift/SwiftPM, zero external Swift
   dependencies, builds with Command Line Tools only (no Xcode). One binary,
-  local child servers for speech and cleanup, 1119 tests including live
+  local child servers for speech and cleanup, 1147 tests including live
   integration against the real STT and LLM servers.
 
 ## Setup
@@ -259,7 +259,7 @@ Restart Flowstate after editing.
 ```sh
 swift build                  # SwiftPM only, no Xcode required
 swift run Murmur             # dev run, inherits the terminal's permissions
-swift run MurmurTests        # 1119 unit + local-integration assertions
+swift run MurmurTests        # 1147 unit + local-integration assertions
 ```
 
 Dev-loop env overrides: `MURMUR_HOTKEY`, `MURMUR_ENGINE`,

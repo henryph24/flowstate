@@ -281,6 +281,66 @@ do {
            "binary-missing error names the remedy")
     expect(LlamaCppError.modelMissing("/y").errorDescription!.contains("install_llama.sh"),
            "model-missing error names the remedy")
+
+    // Cleanup is optional, so a dictation gives up on a server that cannot
+    // serve: a missing binary or model fails before any spawn, and a child
+    // that never answers costs 8 probes 250 ms apart. Only ensureReady()
+    // reports that the server did not start.
+    func cleanupFailure(_ call: () async throws -> Void) async -> String {
+        do {
+            try await call()
+            return "no error"
+        } catch let error as LlamaCppError {
+            switch error {
+            case .binaryMissing: return "binaryMissing"
+            case .modelMissing: return "modelMissing"
+            case .serverTimeout: return "serverTimeout"
+            case .serverLoading: return "serverLoading"
+            case .http: return "http"
+            case .emptyResponse: return "emptyResponse"
+            }
+        } catch {
+            return "\(error)"
+        }
+    }
+    let fixtures = FileManager.default.temporaryDirectory.appendingPathComponent("llama_paths_\(UUID().uuidString)")
+    try? FileManager.default.createDirectory(at: fixtures, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: fixtures) }
+    let exits = fixtures.appendingPathComponent("exits")
+    FileManager.default.createFile(atPath: exits.path, contents: Data("#!/bin/sh\nexit 1\n".utf8),
+                                   attributes: [.posixPermissions: 0o755])
+    let silent = fixtures.appendingPathComponent("silent")
+    FileManager.default.createFile(atPath: silent.path, contents: Data("#!/bin/sh\nexec sleep 5\n".utf8),
+                                   attributes: [.posixPermissions: 0o755])
+    let modelFile = fixtures.appendingPathComponent("model.gguf")
+    FileManager.default.createFile(atPath: modelFile.path, contents: Data([0]))
+    let missing = fixtures.appendingPathComponent("missing").path
+    func engine(binary: String, model: String) -> LlamaCppChatEngine {
+        LlamaCppChatEngine(binaryPath: binary, modelPath: model, port: LocalServer.freeLoopbackPort() ?? 18_786)
+    }
+
+    let noBinary = engine(binary: missing, model: modelFile.path)
+    defer { noBinary.shutdown() }
+    expectEqual(await cleanupFailure { _ = try await noBinary.chatComplete(system: "S.", user: "u", maxTokens: 1) },
+                "binaryMissing", "a missing llama-server fails the cleanup call")
+    let noModel = engine(binary: exits.path, model: missing)
+    defer { noModel.shutdown() }
+    expectEqual(await cleanupFailure { _ = try await noModel.chatComplete(system: "S.", user: "u", maxTokens: 1) },
+                "modelMissing", "a missing cleanup model fails the cleanup call")
+    let crashing = engine(binary: exits.path, model: modelFile.path)
+    defer { crashing.shutdown() }
+    expectEqual(await cleanupFailure { _ = try await crashing.chatComplete(system: "S.", user: "u", maxTokens: 1) },
+                "serverLoading", "a dictation reports a child that exits as not ready")
+    expectEqual(await cleanupFailure { try await crashing.ensureReady() },
+                "serverTimeout", "ensureReady reports a child that exits as not started")
+    let quiet = engine(binary: silent.path, model: modelFile.path)
+    defer { quiet.shutdown() }
+    let budgetStart = Date()
+    expectEqual(await cleanupFailure { _ = try await quiet.chatComplete(system: "S.", user: "u", maxTokens: 1) },
+                "serverLoading", "a dictation gives up on a child that never answers")
+    let budget = -budgetStart.timeIntervalSinceNow
+    expect(budget >= 1.9 && budget < 4,
+           "a dictation probes a child that never answers 8 times, 250 ms apart (got \(String(format: "%.2f", budget)) s)")
 }
 
 // MARK: - ParakeetEngine
@@ -335,6 +395,14 @@ do {
     expect(listening, "test listener is up")
     expect(ChildServer.listens(pid: getpid(), port: heldPort), "the listening process owns its port")
     expect(!ChildServer.listens(pid: 1, port: heldPort), "another pid does not own the port")
+    // Nothing accepts on this port, so a probe gets no answer. It gives up
+    // after 1 s, which each poll of such a port adds to its 250 ms pause.
+    let probeStart = Date()
+    let unanswered = try? await LoopbackURLSession.make(resourceTimeout: 30)
+        .data(for: ChildServer.healthRequest(port: heldPort))
+    let probeTime = -probeStart.timeIntervalSinceNow
+    expect(unanswered == nil && probeTime >= 0.9 && probeTime < 2,
+           "a probe with no answer gives up after about 1 s (got \(String(format: "%.2f", probeTime)) s)")
     close(fd)
     expect(!ChildServer.listens(pid: getpid(), port: heldPort), "a closed port has no owner")
 
@@ -351,7 +419,7 @@ do {
         defer { child.shutdown() }
         let start = Date()
         let ready = try? await child.ensureRunning(polls: 120) {}
-        expectEqual(ready, false, "a child that exits never reports ready")
+        expectEqual(ready, nil, "a child that exits never reports ready")
         expect(-start.timeIntervalSinceNow < 5, "exit detected in under 5 s (got \(String(format: "%.1f", -start.timeIntervalSinceNow)) s)")
         // The port may belong to a process lsof cannot see (another user's),
         // so the next start leaves it.
@@ -374,10 +442,10 @@ do {
         }
         defer { victim.shutdown(); squatter?.stop() }
         let unpolled = try? await victim.ensureRunning(polls: 0) {}
-        expectEqual(unpolled, false, "no polls: spawned, not ready")
+        expectEqual(unpolled, nil, "no polls: spawned, not ready")
         expect(squatter != nil, "squatter listens on the child's port")
         let squatted = try? await victim.ensureRunning(polls: 8) {}
-        expectEqual(squatted, false, "a /health answer from another process is refused")
+        expectEqual(squatted, nil, "a /health answer from another process is refused")
 
         let squattedPort = victim.port
         _ = try? await victim.ensureRunning(polls: 1) {}
@@ -394,7 +462,7 @@ do {
         }
         defer { dying.shutdown(); slowSquatter?.stop() }
         let dyingResult = try? await dying.ensureRunning(polls: 8) {}
-        expectEqual(dyingResult, false, "an answer that arrives after the child died is refused")
+        expectEqual(dyingResult, nil, "an answer that arrives after the child died is refused")
         let dyingPort = dying.port
         slowSquatter?.stop() // now it stands in for a holder lsof cannot see
         _ = try? await dying.ensureRunning(polls: 1) {}
@@ -442,7 +510,7 @@ do {
         raceSquatter = FakeHealthResponder(port: racedPort)
         expect(raceSquatter != nil, "squatter took the stopped child's port")
         let racedResult = try? await polling.value
-        expectEqual(racedResult, false, "a caller never trusts an answer after its child was shut down")
+        expectEqual(racedResult, nil, "a caller never trusts an answer after its child was shut down")
 
         // A shutdown that lands while a start is under way (app quit, engine
         // switch) stops the child that start goes on to spawn.
@@ -462,7 +530,7 @@ do {
                                session: LoopbackURLSession.make(resourceTimeout: 5)) { _ in [] }
         defer { late.shutdown() }
         let lateResult = try? await late.ensureRunning(polls: 4) { late.shutdown() }
-        expectEqual(lateResult, false, "a start overtaken by a shutdown is not ready")
+        expectEqual(lateResult, nil, "a start overtaken by a shutdown is not ready")
         try? await Task.sleep(nanoseconds: 300_000_000)
         let latePID = (try? String(contentsOf: pidFile, encoding: .utf8))
             .flatMap { pid_t($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
@@ -489,25 +557,32 @@ do {
         checkedRef = checked
         defer { checked.shutdown(); checkedResponder?.stop() }
         let checkedResult = try? await checked.ensureRunning(polls: 4) {}
-        expectEqual(checkedResult, false, "a shutdown during the ownership check wins")
+        expectEqual(checkedResult, nil, "a shutdown during the ownership check wins")
 
         var probedRef: ChildServer?
         var probedResponder: FakeHealthResponder?
+        var probedSpawnPort: Int?
         let probed = ChildServer(name: "probed", binaryPath: holder.path,
                                  port: LocalServer.freeLoopbackPort() ?? 18_781,
                                  session: LoopbackURLSession.make(resourceTimeout: 5),
                                  owns: { _, _ in true }) { port in
+            probedSpawnPort = port
             probedResponder = FakeHealthResponder(port: port) { request in
-                if request == 2 { probedRef?.shutdown() }
+                if request == 3 { probedRef?.shutdown() }
             }
             return []
         }
         probedRef = probed
         defer { probed.shutdown(); probedResponder?.stop() }
+        // A caller sends its request to the port returned here: `port` can
+        // move to a new child before the request goes out.
         let probedFirst = try? await probed.ensureRunning(polls: 4) {}
-        expectEqual(probedFirst, true, "a child that answers and holds its port is ready")
+        expect(probedFirst != nil && probedFirst == probedSpawnPort,
+               "a child that answers and holds its port is ready on the port it was given (got \(String(describing: probedFirst)))")
+        let probedQuick = try? await probed.ensureRunning(polls: 4) {}
+        expectEqual(probedQuick, probedFirst, "the quick health check of a verified child returns its port")
         let probedAgain = try? await probed.ensureRunning(polls: 4) {}
-        expectEqual(probedAgain, false, "a shutdown during the quick health check wins")
+        expectEqual(probedAgain, nil, "a shutdown during the quick health check wins")
 
         // A shutdown retires the server: a later start (a dictation chunk that
         // was probing when the engine switched, a warm-up) launches nothing.
@@ -528,7 +603,7 @@ do {
         defer { retired.shutdown() }
         retired.shutdown()
         let afterShutdown = try? await retired.ensureRunning(polls: 2) {}
-        expectEqual(afterShutdown, false, "a start after shutdown is not ready")
+        expectEqual(afterShutdown, nil, "a start after shutdown is not ready")
         try? await Task.sleep(nanoseconds: 500_000_000)
         let retiredLaunched = (try? String(contentsOf: retiredLaunches, encoding: .utf8))?
             .split(separator: "\n").count ?? 0
@@ -546,7 +621,7 @@ do {
                                session: LoopbackURLSession.make(resourceTimeout: 5)) { _ in [] }
         defer { slow.shutdown() }
         let gaveUp = try? await slow.ensureRunning(polls: 1) {}
-        expectEqual(gaveUp, false, "polls ran out before the slow child failed")
+        expectEqual(gaveUp, nil, "polls ran out before the slow child failed")
         try? await Task.sleep(nanoseconds: 1_500_000_000) // the child exits meanwhile
         _ = try? await slow.ensureRunning(polls: 1) {}
         expect(slow.port != slowPort,
@@ -1308,6 +1383,48 @@ do {
 
 // MARK: - AudioRecorder loudness normalization
 
+section("AudioRecorder.meterLevel")
+do {
+    expectEqual(AudioRecorder.meterLevel([Int16]()), 0, "empty buffer meters 0")
+    expectEqual(AudioRecorder.meterLevel([Int16](repeating: 0, count: 480)), 0, "silence meters 0")
+    let full = AudioRecorder.meterLevel([Int16](repeating: 32767, count: 480))
+    expect(full > 0.99 && full <= 1, "full scale meters 1 (got \(full))")
+    let quiet = AudioRecorder.meterLevel([Int16](repeating: 328, count: 480))   // -40 dBFS
+    let speech = AudioRecorder.meterLevel([Int16](repeating: 3277, count: 480)) // -20 dBFS
+    expect(quiet > 0 && quiet < speech && speech < full, "level is monotonic in amplitude")
+    expect(abs(quiet - 1.0 / 3.0) < 0.02, "-40 dBFS maps to a third of the meter on a 60 dB scale (got \(quiet))")
+    expect(abs(speech - 2.0 / 3.0) < 0.02, "-20 dBFS maps to two thirds (got \(speech))")
+    let belowFloor = AudioRecorder.meterLevel([Int16](repeating: 16, count: 480)) // -66 dBFS
+    expectEqual(belowFloor, 0, "below the 60 dB floor clamps to 0")
+    let floats = AudioRecorder.meterLevel([Float](repeating: 0.1, count: 480))
+    expect(abs(floats - speech) < 0.01, "Float32 path matches Int16 at the same amplitude")
+}
+
+section("WaveformBars")
+do {
+    var bars = WaveformBars(count: 5)
+    expectEqual(bars.heights.count, 5, "one height per bar")
+    expect(bars.heights.allSatisfy { $0 == WaveformBars.idleHeight }, "bars rest at the idle height")
+
+    bars.push(level: 1)
+    expectEqual(bars.heights.last, 1, "a new level enters at the newest bar")
+    expectEqual(bars.heights.first, WaveformBars.idleHeight, "older bars are untouched by a push")
+    bars.push(level: 0)
+    expectEqual(bars.heights[3], 1, "pushing shifts the previous level one slot older")
+    expect(bars.heights[4] >= WaveformBars.idleHeight, "a zero level never drops below the idle height")
+
+    var clamped = WaveformBars(count: 3)
+    clamped.push(level: 7)
+    expectEqual(clamped.heights.last, 1, "levels above 1 clamp to 1")
+    clamped.push(level: -3)
+    expectEqual(clamped.heights.last, WaveformBars.idleHeight, "levels below 0 clamp to the idle height")
+
+    var decayed = WaveformBars(count: 3)
+    decayed.push(level: 1)
+    decayed.reset()
+    expect(decayed.heights.allSatisfy { $0 == WaveformBars.idleHeight }, "reset returns every bar to idle")
+}
+
 section("AudioRecorder.normalize")
 do {
     expect(AudioRecorder.normalize([]).isEmpty, "empty stays empty")
@@ -1930,25 +2047,39 @@ await {
     let dictation = Task.detached {
         try await hidden.chatComplete(system: "System: Secret.", user: "dictated words", maxTokens: 8)
     }
-    var hiddenSquatter: FakeHealthResponder?
-    for _ in 0..<300 where hiddenSquatter == nil {
-        if let text = try? String(contentsOf: announced, encoding: .utf8),
-           let port = Int(text.trimmingCharacters(in: .whitespacesAndNewlines)) {
-            hiddenSquatter = FakeHealthResponder(port: port)
-        } else {
+    /// Binds a squatter on the port the latest child announced, once that
+    /// port differs from `previous`.
+    func squatAnnouncedPort(after previous: Int?) async -> (FakeHealthResponder, Int)? {
+        for _ in 0..<300 {
+            if let text = try? String(contentsOf: announced, encoding: .utf8),
+               let port = Int(text.trimmingCharacters(in: .whitespacesAndNewlines)), port != previous,
+               let squatter = FakeHealthResponder(port: port) {
+                return (squatter, port)
+            }
             try? await Task.sleep(nanoseconds: 10_000_000)
         }
+        return nil
     }
-    defer { hiddenSquatter?.stop() }
-    expect(hiddenSquatter != nil, "a squatter took the cleanup child's port after the spawn")
+    let firstSquat = await squatAnnouncedPort(after: nil)
+    defer { firstSquat?.0.stop() }
+    expect(firstSquat != nil, "a squatter took the cleanup child's port after the spawn")
     var refused = false
     if case .failure(let error) = await dictation.result, case LlamaCppError.serverLoading = error {
         refused = true
     }
     expect(refused, "cleanup reports the server not ready when another process answers on its port")
+    // The refusal sends the next child to a fresh port. A key-down prewarm
+    // spawns it there and gives up after its one probe; once a squatter holds
+    // that port as well, the next prewarm probes the squatter and refuses it.
     expectEqual(await hidden.prewarm(prompt: "System: Secret.").value, false,
-                "the cleanup warm-up refuses that server as well")
-    expectEqual(hiddenSquatter?.postCount, 0, "neither the dictated text nor the prompt reaches the squatter")
+                "a prewarm that spawns the next child gives up after one probe")
+    let secondSquat = await squatAnnouncedPort(after: firstSquat?.1)
+    defer { secondSquat?.0.stop() }
+    expect(secondSquat != nil, "a squatter took the next child's port after the spawn")
+    expectEqual(await hidden.prewarm(prompt: "System: Secret.").value, false,
+                "the cleanup warm-up refuses a server its child does not hold")
+    expectEqual(secondSquat?.0.postCount, 0, "the warm-up prompt never reaches that squatter")
+    expectEqual(firstSquat?.0.postCount, 0, "neither the dictated text nor the prompt reaches the squatter")
 
     // Read-ahead: llama-server maps its model file, so weights evicted while
     // the server idles come back one GPU page fault at a time; one sequential
@@ -2702,11 +2833,11 @@ if FileManager.default.isExecutableFile(atPath: parakeetBinary),
             let adopter = ChildServer(name: "adopter", binaryPath: parakeetBinary, port: 18_726,
                                       session: LoopbackURLSession.make(resourceTimeout: 5)) { _ in [] }
             let adopted = try await adopter.ensureRunning(polls: 4) {}
-            expect(adopted && adopter.port == 18_726, "an own-binary server on the port is adopted")
+            expectEqual(adopted, 18_726, "an own-binary server on the port is adopted, and its port returned")
             let overtaken = ChildServer(name: "overtaken", binaryPath: parakeetBinary, port: 18_726,
                                         session: LoopbackURLSession.make(resourceTimeout: 5)) { _ in [] }
             let overtakenResult = try await overtaken.ensureRunning(polls: 4) { overtaken.shutdown() }
-            expectEqual(overtakenResult, false, "an adopting start overtaken by a shutdown is not ready")
+            expectEqual(overtakenResult, nil, "an adopting start overtaken by a shutdown is not ready")
             expectEqual(try await engine.transcribe(wav: wav), transcript,
                         "the adopted child keeps serving its owner")
         } catch {

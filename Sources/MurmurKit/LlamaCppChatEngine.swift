@@ -30,10 +30,12 @@ public enum LlamaCppError: Error, LocalizedError {
 /// `ChildServer`, speaking its OpenAI-compatible `/v1/chat/completions`.
 /// `ChildServer` reuses a verified orphan, accepts a spawned child only once
 /// the child holds its port, and runs one start at a time. Cleanup is
-/// optional, so a dictation waits at most 2 s for the server (plus a start
-/// already under way, which polls once) and otherwise throws: `Cleaner`
-/// falls back to the raw transcript. Only `ensureReady()` sits through a cold
-/// model load.
+/// optional, so a dictation probes the server 8 times, 250 ms apart, and
+/// then throws: `Cleaner` falls back to the raw transcript. That takes 2 s
+/// when nothing listens, and up to 10 s when the port accepts but never
+/// answers (a probe gives up after 1 s). A start already under way (the
+/// launch warm-up or the key-down prewarm, one probe each) runs first. Only
+/// `ensureReady()` sits through a cold model load.
 public final class LlamaCppChatEngine: ChatEngine, LocalServerEngine, Prewarmable {
     static let warmUpPolls = 240 // × 250ms = 60s — cold GGUF load
     static let requestPolls = 8  // × 250ms = 2s — never make a paste wait
@@ -60,9 +62,9 @@ public final class LlamaCppChatEngine: ChatEngine, LocalServerEngine, Prewarmabl
     deinit { shutdown() }
 
     public func chatComplete(system: String, user: String, maxTokens: Int) async throws -> String {
-        try await ensureServerRunning(polls: Self.requestPolls)
+        let port = try await ensureServerRunning(polls: Self.requestPolls)
         let request = try Self.makeChatRequest(system: system, user: user,
-                                               maxTokens: maxTokens, port: server.port)
+                                               maxTokens: maxTokens, port: port)
         let (data, response) = try await session.data(for: request)
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         guard status == 200 else { throw LlamaCppError.http(status: status) }
@@ -73,14 +75,14 @@ public final class LlamaCppChatEngine: ChatEngine, LocalServerEngine, Prewarmabl
     /// utterance. Safe to call repeatedly.
     public func warmUp() {
         Task.detached { [weak self] in
-            try? await self?.ensureServerRunning(polls: Self.spawnPolls)
+            _ = try? await self?.ensureServerRunning(polls: Self.spawnPolls)
         }
     }
 
     /// Blocks through a full cold load — for tests/pre-flight, not the
     /// utterance path.
     public func ensureReady() async throws {
-        try await ensureServerRunning(polls: Self.warmUpPolls)
+        _ = try await ensureServerRunning(polls: Self.warmUpPolls)
     }
 
     /// `prompt` is the cleanup system prompt (see `Cleaner.prewarm`). Reads
@@ -92,8 +94,8 @@ public final class LlamaCppChatEngine: ChatEngine, LocalServerEngine, Prewarmabl
             guard let self else { return false }
             async let weights: Void = Prewarm.readAheadInBackground(self.modelPath)
             var answered = false
-            if (try? await self.ensureServerRunning(polls: Self.spawnPolls)) != nil {
-                answered = await Prewarm.send(try? Self.makePrewarmRequest(system: prompt ?? "", port: self.server.port),
+            if let port = try? await self.ensureServerRunning(polls: Self.spawnPolls) {
+                answered = await Prewarm.send(try? Self.makePrewarmRequest(system: prompt ?? "", port: port),
                                               with: self.session)
             }
             await weights
@@ -105,8 +107,9 @@ public final class LlamaCppChatEngine: ChatEngine, LocalServerEngine, Prewarmabl
         server.shutdown()
     }
 
-    private func ensureServerRunning(polls: Int) async throws {
-        let ready = try await server.ensureRunning(polls: polls) {
+    /// The port of the verified server.
+    private func ensureServerRunning(polls: Int) async throws -> Int {
+        let port = try await server.ensureRunning(polls: polls) {
             guard LocalServer.isSafeToExecute(binaryPath) else {
                 throw LlamaCppError.binaryMissing(binaryPath)
             }
@@ -114,9 +117,10 @@ public final class LlamaCppChatEngine: ChatEngine, LocalServerEngine, Prewarmabl
                 throw LlamaCppError.modelMissing(modelPath)
             }
         }
-        guard ready else {
+        guard let port else {
             throw polls < Self.warmUpPolls ? LlamaCppError.serverLoading : LlamaCppError.serverTimeout
         }
+        return port
     }
 
     // MARK: pure builders

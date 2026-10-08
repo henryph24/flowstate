@@ -73,6 +73,38 @@ public final class AudioRecorder {
         return out
     }
 
+    /// dB range the HUD meter spans: -60 dBFS reads 0, 0 dBFS reads 1.
+    public static let meterRangeDB: Float = 60
+
+    /// Perceptual input level in 0...1 for the HUD waveform: RMS in dBFS,
+    /// mapped linearly over `meterRangeDB`. Pure (testable).
+    public static func meterLevel(_ samples: [Int16]) -> Float {
+        guard !samples.isEmpty else { return 0 }
+        var sumSquares = 0.0
+        for sample in samples {
+            let normalized = Double(sample) / 32768.0
+            sumSquares += normalized * normalized
+        }
+        return meterLevel(meanSquare: sumSquares / Double(samples.count))
+    }
+
+    public static func meterLevel(_ samples: [Float]) -> Float {
+        guard !samples.isEmpty else { return 0 }
+        var sumSquares = 0.0
+        for sample in samples { sumSquares += Double(sample) * Double(sample) }
+        return meterLevel(meanSquare: sumSquares / Double(samples.count))
+    }
+
+    private static func meterLevel(meanSquare: Double) -> Float {
+        guard meanSquare > 0 else { return 0 }
+        let dB = Float(10 * log10(meanSquare)) // 20·log10(rms)
+        return max(0, min(1, (dB + meterRangeDB) / meterRangeDB))
+    }
+
+    /// Fired on the audio thread with the `meterLevel` of each converted
+    /// buffer, in both output modes. Must not block.
+    public var onLevel: ((Float) -> Void)?
+
     /// Set before `start()`. Defaults to the original 16 kHz Int16 batch path.
     public var outputMode: OutputMode = .batchInt16
 
@@ -187,12 +219,15 @@ public final class AudioRecorder {
             guard let channelData = output.floatChannelData else { return }
             let chunk = Array(UnsafeBufferPointer(start: channelData[0],
                                                   count: Int(output.frameLength)))
+            onLevel?(Self.meterLevel(chunk))
             onChunk?(chunk)
         } else {
             guard let channelData = output.int16ChannelData else { return }
+            let chunk = Array(UnsafeBufferPointer(start: channelData[0],
+                                                  count: Int(output.frameLength)))
+            onLevel?(Self.meterLevel(chunk))
             lock.lock()
-            samples.append(contentsOf: UnsafeBufferPointer(start: channelData[0],
-                                                           count: Int(output.frameLength)))
+            samples.append(contentsOf: chunk)
             lock.unlock()
         }
     }
