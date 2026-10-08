@@ -82,6 +82,7 @@ public final class AppController {
 
         statusWindow.onSetAPIKey = { [weak self] in self?.promptForAPIKey() }
         statusWindow.onSelectEngine = { [weak self] kind in self?.selectEngine(kind) }
+        statusWindow.onToggleCleanup = { [weak self] in self?.toggleCleanup() }
         statusWindow.onStartAtLogin = { [weak self] in self?.toggleLaunchAtLogin() }
         statusWindow.onQuit = { NSApp.terminate(nil) }
 
@@ -574,9 +575,12 @@ public final class AppController {
         statusItem.setCleanupChecked(config.cleanupEnabled)
         statusItem.setDockIconChecked(config.showDockIcon)
         statusItem.setLaunchAtLoginChecked(SMAppService.mainApp.status == .enabled)
-        statusWindow.update(
-            statusText: "Hold \(config.hotkey.displayName) to dictate · \(status)",
-            selectedEngine: config.engine)
+        statusWindow.update(.init(
+            hotkey: config.hotkey.displayName,
+            engine: config.engine,
+            problem: engineHint,
+            cleanupEnabled: config.cleanupEnabled,
+            launchAtLogin: SMAppService.mainApp.status == .enabled))
         updateIcon()
     }
 
