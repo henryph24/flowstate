@@ -1,0 +1,1 @@
+improve the UI of the app when triggering. It looks ugly now.
