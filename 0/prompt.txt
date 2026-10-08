@@ -1,0 +1,69 @@
+<task-notification>
+<task-id>a698b1e23ecf21095</task-id>
+<output-file>/private/tmp/claude-501/-Users-hungpq2412-flowstate/00970eab-b642-464c-aea9-038129ac6287/tasks/a698b1e23ecf21095.output</output-file>
+<status>completed</status>
+<summary>Agent "Verify cleanup engine ChildServer move" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>The change does what criteria 1, 2, 5, 6 and 8 ask, and criteria 3 and 4 pass by reading the code. Criterion 7 fails on one doc number. One test assertion passes for a reason other than the one it names. Commit 12abb6b has the same Sources as the tree I reviewed: `diff -rq` printed nothing.
+
+1. **PASS.** Start, adopt and stop all go through ChildServer (LlamaCppChatEngine.swift:54-57, 104-119). A spawned child counts only if the child itself holds the port (ChildServer.swift:152-164). Adoption needs the listener's executable to be our binary (LoopbackSession.swift:59-64). Suite log: "llama-server: another process answered on port 60392; refusing it".
+
+2. **PASS.** The engine stores only `let` properties (LlamaCppChatEngine.swift:43-46). ChildServer's state sits behind `lock` (ChildServer.swift:24-30), and one start runs at a time (`StartGate`).
+
+3. **PASS, by code reading only.** No test covers the 2 s budget or `serverTimeout`.
+   - Dictation polls 8 times and throws `serverLoading`; `ensureReady()` polls 240 times and throws `serverTimeout` (:63, :83, :118).
+   - Warm-up and prewarm poll once (:41).
+   - The "2 s" is only the sleep time. Each probe can take up to 1 s (ChildServer.swift:82), so a port that accepts but stalls costs about 10 s. 9140b07 behaved the same way.
+   - The gate serves callers in arrival order. The launch warm-up and the key-down prewarm can both be queued ahead of a dictation if the key is pressed within about 1 s of a cleanup rebuild.
+
+4. **PASS. All changes are safe for the callers.**
+   - Kept:
+     - The binaryMissing/modelMissing checks (:110-115), which still run only when no child is running (ChildServer.swift:103-107).
+     - The server arguments (unchanged; live pid 4794 runs `--host 127.0.0.1 --port 8725 -c 4096 -ngl 99 -t 6`).
+     - Reuse of an orphan of its own binary.
+     - The private port (log: "port 60383 held by another process — using a private port instead", then "spawned (pid 5494, port 60390)").
+   - Changed:
+     - `shutdown()` is now final. Its two callers (AppController.swift:142-143 and 423-424) drop the engine or build a new one, so nothing reuses a shut-down engine.
+     - `warmUp` and `prewarm` now poll once; callers ignore the results.
+     - A child that exits early fails at once.
+     - After a refused or failed child, the engine stays on fresh ports and no longer adopts the orphan on 8725.
+     - The public `LlamaCppChatEngine.healthRequest` is gone; grep finds no callers.
+
+5. **PASS, with one weak assertion.** I ran the suite on a copy of 12abb6b with the 9140b07 engine: "1116 passed, 3 failed". The failures are at main.swift:1948, 1949 and 1951 ("got Optional(2), expected Optional(0)").
+   - **Weak assertion (main.swift:1949, warm-up):** on the new engine it passes without the squatter ever being probed. After the abandon, the prewarm's start spawns on a fresh port (ChildServer.swift:116-117, 180) where the test puts no squatter. Log: "spawned (pid 5506, port 60397)", with no refusal on 60397. It would still pass if prewarm skipped the ownership check.
+
+6. **PASS.** "1119 passed, 0 failed", exit 0, 56 s. The repo build was a no-op. Fresh builds of 9140b07 and 12abb6b each show 0 Swift source warnings and the same 69 toolchain warning lines. Integration sections:
+   - read-ahead on a model file: round 1 0.43s, round 2 0.40s, 100% resident both times.
+   - local whisper.cpp STT: spawned on 18723; transcript 1.89s incl. model load; warm second pass 0.68s.
+   - local Parakeet STT: spawned on 18726; 1.08s; warm 0.06s; prewarm 0.04s; silence ''; 70 s chunked 0.83s.
+   - local Qwen3-ASR STT: spawned on 18727; 6.19s; warm 0.19s; prewarm 0.08s; 70 s chunked 1.63s.
+   - local Kyutai streaming STT: spawned on 18724; pass 1 2.23s; pass 2 warm 1.96s; pass 3 silence 1.68s ''.
+   - local llama.cpp cleanup: spawned (pid 6026, port 18725); "server ready in 3.0s"; "cleaned: So basically I think we should meet at 3 pm"; "warm call: 0.29s"; "prewarm: 0.06s".
+   - Groq: SKIPPED, as expected.
+   - After both suite runs, `pgrep -fl 'llama-server|whisper-server|parakeet-server'` lists only 4794 and 4795.
+
+7. **FAIL.**
+   - README: "1119" matches the suite. The README latency numbers match todo.md:107 ("3 s hold 0.88-1.09 s ... plain 5.78-6.19 s"). The SECURITY.md parakeet.cpp loopback claim holds (ParakeetEngine.swift:100). The added lines contain 0 em dashes.
+   - **Unsupported number:** TranscriptionEngine.swift:51 says "0.6 to 0.8 s warm", but todo.md "Dictation slowdown" records "0.56-1.0 s warm" (line 97) and has no 0.8 s warm figure.
+   - **Overstated claim:** LlamaCppChatEngine.swift:33 says "waits at most 2 s", which ignores probe time (see 3).
+
+8. **PASS.**
+   - `codesign --verify --deep --strict` reports "valid on disk" and "satisfies its Designated Requirement".
+   - The binary was written at 14:01:28. `nm` finds 25 symbols of the new `ensureServerRunning(polls:)` and 0 of the old `pollBudget`.
+   - pid 4785 started at 14:02:16, after the binary was written. pids 4794 and 4795 have parent 4785. `lsof` shows 4794 listening on 127.0.0.1:8725 and 4795 on 127.0.0.1:8727.
+
+**Other defects (all low severity):**
+- **Port read in a separate step:** after `ensureRunning` returns, the engine reads `server.port` separately (:65, :96). If the verified child dies in that gap and a concurrent warm-up respawns it elsewhere, the POST goes to a port nobody verified. Having `ensureRunning` return the verified port would close this.
+- **Missing tests:** none makes the engine throw binaryMissing or modelMissing; main.swift:275-282 checks only the message text.
+
+**Not done:** the 2 s and 60 s timings were checked by reading code, not by a test. The scratch folder became unavailable after my last run, so its logs may be gone.</result>
+<usage><subagent_tokens>142314</subagent_tokens><tool_uses>2</tool_uses><duration_ms>580351</duration_ms></usage>
+</task-notification>
+
+---
+
+Check whether the third verification subagent (cleanup engine on ChildServer) has reported; if not, read its transcript's last write time and stop it if blocked; then act on its findings and write the final report.
+
+---
+
+Check whether the third verification subagent (cleanup engine on ChildServer) has reported; if not, read its transcript's last write time and stop it if blocked; then act on its findings and write the final report.
